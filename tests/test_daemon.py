@@ -52,19 +52,22 @@ class DaemonTest(unittest.TestCase):
         self.commands = self.module / "commands"
         self.commands.mkdir()
         self.requests = []
+        self.request_times = []
         self.observed_cursors = []
         self.reply = (200, b'{"code":200,"message":"success"}')
-        self.delay = 0
         owner = self
 
         class Receiver(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 payload = self.rfile.read(int(self.headers["Content-Length"]))
-                owner.observed_cursors.append(owner.cursor() if owner.cursor_file.exists() else None)
+                owner.observed_cursors.append(owner.cursor() if owner.cursor_file.is_file() else None)
                 owner.requests.append((self.path, self.headers, payload))
-                time.sleep(owner.delay)
+                owner.request_times.append(time.monotonic())
                 status, body = owner.reply(len(owner.requests)) if callable(owner.reply) else owner.reply
                 try:
+                    if status is None:
+                        self.close_connection = True
+                        return
                     self.send_response(status)
                     self.end_headers()
                     self.wfile.write(body)
@@ -357,6 +360,7 @@ exec /usr/bin/busybox "$@"
         self.startup_config()
         provider = (self.commands / "content").read_text(encoding="utf-8")
         for output, code in (("Error while accessing provider", 0), ("", 0),
+                             ("No result found.\nError while accessing provider", 0),
                              ("No result found.", 1)):
             with self.subTest(output=output, code=code):
                 self.polls.unlink(missing_ok=True)
@@ -447,24 +451,171 @@ esac
             wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= 2)
             self.assertEqual(self.cursor(), "100 2")
             self.assertEqual(len(self.requests), 1)
+            self.write_command("content", provider)
+            wait_for(lambda: self.cursor() == "100 4")
+            self.assertEqual([json.loads(request[2])["body"].splitlines()[-1]
+                              for request in self.requests],
+                             ["message 2", "message 3", "message 4"])
+            self.assert_no_payload_files_or_sensitive_logs()
 
     def test_commit_failure_stops_before_later_records(self):
         self.startup_config()
         pending = self.module / "state/sms.cursor.tmp"
 
-        def block_commit(_):
-            pending.mkdir(exist_ok=True)
+        def block_commit(count):
+            if count == 2:
+                pending.mkdir(exist_ok=True)
             return 200, b'{"code":200}'
 
         self.reply = block_commit
         with self.running_daemon():
             wait_for(self.polls.exists)
             self.write_sms_records([(i, 100, 1, "synthetic", f"message {i}")
-                                    for i in (2, 3)])
+                                    for i in (2, 3, 4)])
             wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= 2)
-            self.assertEqual(self.cursor(), "1 1")
-            self.assertEqual(len(self.requests), 1)
+            self.assertEqual(self.cursor(), "100 2")
+            self.assertEqual(len(self.requests), 2)
             self.assertIn("进度提交失败", (self.tmp / "sms_forward_run.log").read_text(encoding="utf-8"))
+            pending.rmdir()
+            self.reply = (200, b'{"code":200}')
+            wait_for(lambda: self.cursor() == "100 4")
+            self.assertEqual([json.loads(request[2])["body"].splitlines()[-1]
+                              for request in self.requests],
+                             ["message 2", "message 3", "message 3", "message 4"])
+            self.assert_no_payload_files_or_sensitive_logs()
+
+    def test_directory_at_cursor_destination_is_a_commit_failure(self):
+        self.startup_config()
+        saved = self.module / "saved.cursor"
+
+        def replace_destination(count):
+            if count == 2:
+                self.cursor_file.rename(saved)
+                self.cursor_file.mkdir()
+            return 200, b'{"code":200}'
+
+        self.reply = replace_destination
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            self.write_sms_records([(i, 100, 1, "synthetic", f"message {i}")
+                                    for i in (2, 3, 4)])
+            wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= 2)
+            self.assertEqual(len(self.requests), 2)
+            self.assertEqual(saved.read_bytes(), b"100 2\n")
+            self.assertEqual(list(self.cursor_file.iterdir()), [])
+            self.assertIn("进度提交失败", (self.tmp / "sms_forward_run.log").read_text(encoding="utf-8"))
+        self.cursor_file.rmdir()
+        saved.replace(self.cursor_file)
+        self.reply = (200, b'{"code":200}')
+        with self.running_daemon():
+            wait_for(lambda: self.cursor() == "100 4")
+            self.assertEqual([json.loads(request[2])["body"].splitlines()[-1]
+                              for request in self.requests],
+                             ["message 2", "message 3", "message 3", "message 4"])
+            self.assert_no_payload_files_or_sensitive_logs()
+
+    def test_siminfo_error_after_a_row_does_not_initialize_or_advance(self):
+        self.startup_config()
+        self.siminfo_fixture.write_text(
+            "Row: 0 _id=1, sim_id=0\nError while accessing provider\n", encoding="utf-8")
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            self.assertFalse(self.cursor_file.exists())
+            self.siminfo_fixture.write_text("Row: 0 _id=1, sim_id=0\n", encoding="utf-8")
+            wait_for(lambda: self.cursor_file.exists() and self.cursor() == "1 1")
+            wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= 2)
+            poll_count = self.polls.read_text(encoding="utf-8").count("poll")
+            self.siminfo_fixture.write_text(
+                "Row: 0 _id=1, sim_id=0\nError while accessing provider\n", encoding="utf-8")
+            self.write_sms_records([(2, 100, 1, "synthetic", BODY)])
+            wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") > poll_count)
+            self.assertEqual(self.cursor(), "1 1")
+            self.assertEqual(self.requests, [])
+            self.siminfo_fixture.write_text("Row: 0 _id=1, sim_id=0\n", encoding="utf-8")
+            wait_for(lambda: self.cursor() == "100 2")
+            self.assertEqual(len(self.requests), 1)
+
+    def test_provider_poll_errors_preserve_cursor_and_recover(self):
+        self.startup_config()
+        provider = (self.commands / "content").read_text(encoding="utf-8")
+        cases = [("Error while accessing provider", 0, ""),
+                 ("No result found.", 1, ""),
+                 ("No result found.", 0, "Error while accessing provider"),
+                 ("Row: 0 invalid", 0, "")]
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            for message_id, (output, code, error) in enumerate(cases, start=2):
+                with self.subTest(output=output, code=code, error=error):
+                    previous = self.cursor()
+                    poll_count = self.polls.read_text(encoding="utf-8").count("poll")
+                    self.write_command("content", f'''#!/bin/sh
+case "$*" in
+  *siminfo*) cat "$SIMINFO_FIXTURE" ;;
+  *) printf '%s\\n' '{output}'; printf '%s' '{error}' >&2; exit {code} ;;
+esac
+''')
+                    self.write_sms_records([(message_id, 100, 1, "synthetic", BODY)])
+                    wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") > poll_count)
+                    self.assertEqual(self.cursor(), previous)
+                    self.assertEqual(len(self.requests), message_id - 2)
+                    self.write_command("content", provider)
+                    wait_for(lambda: self.cursor() == f"100 {message_id}")
+                    wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= poll_count + 2)
+            self.assertEqual(len(self.requests), len(cases))
+            self.assert_no_payload_files_or_sensitive_logs()
+
+    def test_deleted_failed_sms_is_not_replayed_from_the_previous_batch(self):
+        self.startup_config()
+        self.reply = lambda count: (200, b'{"code":200}') if count == 1 else (503, b'{}')
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            self.write_sms_records([(i, 100, 1, "synthetic", f"message {i}")
+                                    for i in (2, 3, 4)])
+            wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= 2)
+            self.assertEqual(self.cursor(), "100 2")
+            self.assertEqual(len(self.requests), 2)
+            # Remove the failed source and change the next source to prove a reread.
+            self.write_sms_records([(4, 100, 1, "synthetic", "updated message 4")])
+            self.reply = (200, b'{"code":200}')
+            wait_for(lambda: self.cursor() == "100 4")
+            self.assertEqual([json.loads(request[2])["body"].splitlines()[-1]
+                              for request in self.requests],
+                             ["message 2", "message 3", "updated message 4"])
+            self.assertGreaterEqual(self.request_times[2] - self.request_times[1], 0.9)
+            self.assert_no_payload_files_or_sensitive_logs()
+
+    def test_kill_after_success_before_replace_replays_uncommitted_sms(self):
+        self.startup_config()
+        reached = self.module / "replace-reached"
+        block = self.module / "block-replace"
+        self.write_command("mv", '''#!/bin/sh
+for destination do :; done
+module=${destination%/state/sms.cursor}
+if [ "$module" != "$destination" ] && [ -f "$module/block-replace" ]; then
+    touch "$module/replace-reached"
+    while true; do /bin/sleep 0.1; done
+fi
+exec /bin/mv "$@"
+''')
+        with self.running_daemon() as process:
+            wait_for(self.polls.exists)
+            block.touch()
+            self.write_sms_records([(i, 100, 1, "synthetic", f"message {i}")
+                                    for i in (2, 3)])
+            wait_for(reached.exists)
+            self.assertEqual(self.cursor_file.read_bytes(), b"1 1\n")
+            self.assertEqual((self.module / "state/sms.cursor.tmp").read_bytes(), b"100 2\n")
+            self.assertEqual(len(self.requests), 1)
+            self.assertIn("Bark 服务确认成功", (self.tmp / "sms_forward_run.log").read_text(encoding="utf-8"))
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=3)
+        block.unlink()
+        with self.running_daemon():
+            wait_for(lambda: self.cursor() == "100 3")
+            self.assertEqual([json.loads(request[2])["body"].splitlines()[-1]
+                              for request in self.requests],
+                             ["message 2", "message 2", "message 3"])
+            self.assert_no_payload_files_or_sensitive_logs()
 
     @contextlib.contextmanager
     def daemon(self, subscription_id=1, siminfo=None, initial_new_sms=True):
@@ -618,6 +769,7 @@ INTERVAL=1
 
     def test_failure_response_does_not_advance_caller(self):
         cases = [
+            (None, b''),
             (503, b'{"code":200}'),
             (200, b'{"code":400,"message":"200"}'),
             (200, b''),
@@ -630,15 +782,25 @@ INTERVAL=1
         ]
         for status, body in cases:
             with self.subTest(status=status, body=body):
-                self.reply = (status, body)
+                self.reply = lambda count, failure=(status, body): (
+                    (200, b'{"code":200}') if count == 1 else failure)
                 # Each process gets a fresh initial boundary.
                 self.polls.unlink(missing_ok=True)
                 self.cursor_file.unlink(missing_ok=True)
                 self.requests.clear()
-                with self.daemon():
+                self.request_times.clear()
+                with self.daemon(initial_new_sms=False):
+                    self.write_sms_records([(i, 100, 1, "synthetic", f"message {i}")
+                                            for i in (2, 3, 4)])
                     self.wait_for_attempt()
-                    self.assertEqual(self.cursor(), "1 1")
-                    self.assertEqual(len(self.requests), 1)
+                    self.assertEqual(self.cursor(), "100 2")
+                    self.assertEqual(len(self.requests), 2)
+                    self.reply = (200, b'{"code":200}')
+                    wait_for(lambda: self.cursor() == "100 4")
+                    self.assertEqual([json.loads(request[2])["body"].splitlines()[-1]
+                                      for request in self.requests],
+                                     ["message 2", "message 3", "message 3", "message 4"])
+                    self.assertGreaterEqual(self.request_times[2] - self.request_times[1], 0.9)
                     self.assert_no_payload_files_or_sensitive_logs()
 
     def test_client_exit_error_rejects_even_success_looking_output(self):
@@ -652,14 +814,29 @@ INTERVAL=1
             self.assert_no_payload_files_or_sensitive_logs()
 
     def test_request_timeout_is_bounded_without_internal_retry(self):
-        self.delay = 7
-        with self.daemon():
+        def timeout_second(count):
+            if count == 2:
+                time.sleep(7)
+            return 200, b'{"code":200}'
+
+        self.reply = timeout_second
+        with self.daemon(initial_new_sms=False):
             started = time.monotonic()
+            self.write_sms_records([(i, 100, 1, "synthetic", f"message {i}")
+                                    for i in (2, 3, 4)])
             self.wait_for_attempt()
+            failed_round_finished = time.monotonic()
             self.assertGreater(time.monotonic() - started, 4.5)
-            self.assertLess(time.monotonic() - started, 6.5)
-            self.assertEqual(self.cursor(), "1 1")
-            self.assertEqual(len(self.requests), 1)
+            self.assertLess(time.monotonic() - started, 7)
+            self.assertEqual(self.cursor(), "100 2")
+            self.assertEqual(len(self.requests), 2)
+            self.reply = (200, b'{"code":200}')
+            wait_for(lambda: self.cursor() == "100 4")
+            self.assertEqual([json.loads(request[2])["body"].splitlines()[-1]
+                              for request in self.requests],
+                             ["message 2", "message 3", "message 3", "message 4"])
+            self.assertGreaterEqual(self.request_times[2] - failed_round_finished, 0.9)
+            self.assert_no_payload_files_or_sensitive_logs()
 
     def test_untrusted_certificate_is_rejected(self):
         (self.module / ".curlrc").write_text("insecure\nretry = 3\n", encoding="utf-8")

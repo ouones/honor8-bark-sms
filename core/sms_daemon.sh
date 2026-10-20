@@ -176,8 +176,9 @@ read_sms_cursor() {
 
 commit_sms_cursor() {
     local pending="$SMS_STATE_DIR/sms.cursor.tmp"
+    # -T 拒绝目录目标，避免把目录内移动误判为进度提交成功。
     if printf '%s %s\n' "$1" "$2" > "$pending" && chmod 600 "$pending" &&
-        mv -f "$pending" "$SMS_CURSOR"; then
+        mv -fT "$pending" "$SMS_CURSOR"; then
         return 0
     fi
     rm -f "$pending"
@@ -212,8 +213,13 @@ query_sms_rows() {
 
 get_sim1_sub_id() {
     local raw_siminfo
-    raw_siminfo=$(content query --uri content://telephony/siminfo --projection _id:sim_id 2>/dev/null) || return 1
+    raw_siminfo=$(content query --uri content://telephony/siminfo --projection _id:sim_id 2>&1) || {
+        log_msg "ERROR" "SIM1 订阅查询失败"
+        return 1
+    }
+    [ "$raw_siminfo" = "No result found." ] && return 1
     printf '%s\n' "$raw_siminfo" | awk -F '[, =]+' '
+    $0 !~ /^Row: [0-9]+ _id=[0-9]+, sim_id=-?[0-9]+$/ { invalid = 1; next }
     {
         id = ""
         slot = ""
@@ -226,8 +232,11 @@ get_sim1_sub_id() {
             selected = id
         }
     }
-    END { if (count == 1) print selected }
-    '
+    END {
+        if (invalid) exit 1
+        if (count == 1) print selected
+    }
+    ' || { log_msg "ERROR" "SIM1 订阅查询结果无效"; return 1; }
 }
 
 hex_to_utf8() {
