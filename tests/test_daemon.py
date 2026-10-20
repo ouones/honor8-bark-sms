@@ -144,9 +144,10 @@ exec /bin/sleep "$@"
         return self.module / "state/sms.cursor"
 
     def startup_config(self, extra=""):
+        # 通用夹具使用订阅 ID；荣耀8的卡槽格式由独立 EMUI 回归覆盖。
         with (self.module / "core/config.conf").open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(f'\nBARK_API_URL="{self.url}"\nBARK_DEVICE_KEY="{KEY}"\n'
-                         f'TMP_DIR="{self.tmp}"\nINTERVAL=1\n{extra}\n')
+                         f'TMP_DIR="{self.tmp}"\nOS_TYPE="HyperOS"\nINTERVAL=1\n{extra}\n')
 
     def startup_env(self):
         return dict(os.environ, PATH=f"{self.commands}:{os.environ['PATH']}",
@@ -745,7 +746,7 @@ ENABLE_SMS="true"
 ENABLE_MISSED_CALL="false"
 ENABLE_INCOMING_CALL="false"
 ENABLE_OUTGOING_CALL="false"
-OS_TYPE="EMUI"
+OS_TYPE="HyperOS"
 INTERVAL=1
 ''')
         env = self.startup_env()
@@ -800,6 +801,36 @@ INTERVAL=1
             data = json.loads(self.requests[0][2].decode("utf-8"))
             self.assertEqual(data["copy"], "123456")
             self.assertIn(body, data["body"])
+
+    def test_honor8_emui_uses_sms_slot_id_and_excludes_sim2(self):
+        self.startup_config('OS_TYPE="EMUI"')
+        self.siminfo_fixture.write_text(
+            "Row: 0 _id=42, sim_id=0\nRow: 1 _id=77, sim_id=1\n", encoding="utf-8")
+        self.write_sms_records([
+            (1, 1, 0, "synthetic", "SIM1 history"),
+            (9, 9, 42, "other", "subscription ID is not the SMS slot"),
+        ])
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            self.assertEqual(self.cursor(), "1 1")
+            self.assertEqual(self.requests, [])
+            self.write_sms_records([
+                (1, 1, 0, "synthetic", "SIM1 history"),
+                (2, 2, 0, "synthetic", BODY),
+                (3, 3, 0, "synthetic", "验证码 654321"),
+                (4, 4, 1, "other", "SIM2 must not be forwarded"),
+            ])
+            wait_for(lambda: self.cursor() == "3 3")
+            time.sleep(1.2)
+            self.assertEqual(len(self.requests), 2)
+            self.assertIn(BODY, json.loads(self.requests[0][2])["body"])
+            self.assertEqual(json.loads(self.requests[1][2])["copy"], "654321")
+        polls_before_restart = self.polls.read_text(encoding="utf-8").count("poll")
+        with self.running_daemon() as process:
+            wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") > polls_before_restart)
+            self.assertIsNone(process.poll())
+            self.assertEqual(self.cursor(), "3 3")
+            self.assertEqual(len(self.requests), 2)
 
     def test_sim1_sms_is_complete_and_uses_the_mapped_subscription(self):
         subscription_id = 42

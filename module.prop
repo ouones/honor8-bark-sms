@@ -1,6 +1,6 @@
 id=hyperos_sms_forwarder
 name=短信电话底层转发
-version=v2.2
-versionCode=1
+version=v2.3-honor8-bark
+versionCode=2
 author=双曲线与圆
-description=利用Root权限直连底层Provider，纯Shell守护无感转发短信与未接来电（支持自定义开启已接/拨出记录）。自带断网重发与防爆存储，彻底告别备用机漏接。增加智能提取功能。具体使用方法请看README.md
+description=荣耀8 SIM1 短信正常联网时秒级转发至 Bark，支持验证码复制、发送进度接续与断网恢复。首次跳过历史，补发依赖系统收件箱；支持范围与验收结果见 README.md。

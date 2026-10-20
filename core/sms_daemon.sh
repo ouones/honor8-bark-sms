@@ -220,7 +220,7 @@ get_sim1_sub_id() {
         return 1
     }
     [ "$raw_siminfo" = "No result found." ] && return 1
-    printf '%s\n' "$raw_siminfo" | awk -F '[, =]+' '
+    printf '%s\n' "$raw_siminfo" | awk -v os="$OS_TYPE" -F '[, =]+' '
     $0 !~ /^Row: [0-9]+ _id=[0-9]+, sim_id=-?[0-9]+$/ { invalid = 1; next }
     {
         id = ""
@@ -231,7 +231,8 @@ get_sim1_sub_id() {
         }
         if (slot == "0" && id ~ /^[0-9]+$/) {
             count++
-            selected = id
+            # 目标荣耀8 EMUI 8 的短信 sub_id 存储卡槽号，非订阅表主键。
+            selected = (os == "EMUI" ? slot : id)
         }
     }
     END {
