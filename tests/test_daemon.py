@@ -52,6 +52,7 @@ class DaemonTest(unittest.TestCase):
         self.commands = self.module / "commands"
         self.commands.mkdir()
         self.requests = []
+        self.observed_cursors = []
         self.reply = (200, b'{"code":200,"message":"success"}')
         self.delay = 0
         owner = self
@@ -59,9 +60,10 @@ class DaemonTest(unittest.TestCase):
         class Receiver(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 payload = self.rfile.read(int(self.headers["Content-Length"]))
+                owner.observed_cursors.append(owner.cursor() if owner.cursor_file.exists() else None)
                 owner.requests.append((self.path, self.headers, payload))
                 time.sleep(owner.delay)
-                status, body = owner.reply
+                status, body = owner.reply(len(owner.requests)) if callable(owner.reply) else owner.reply
                 try:
                     self.send_response(status)
                     self.end_headers()
@@ -81,29 +83,38 @@ class DaemonTest(unittest.TestCase):
         self.addCleanup(self.server.shutdown)
         self.url = f"http://127.0.0.1:{self.server.server_port}/custom/push"
         self.fixture = self.module / "synthetic-provider.txt"
-        self.hex_fixture = self.module / "synthetic-provider-hex.txt"
         self.siminfo_fixture = self.module / "synthetic-siminfo.txt"
         self.content_calls = self.module / "content-calls.txt"
         self.siminfo_fixture.write_text("Row: 0 _id=1, sim_id=0\n", encoding="utf-8")
         self.content_calls.write_text("", encoding="utf-8")
-        self.write_command("content", '''#!/bin/sh
-printf '%s\\n' "$*" >> "$CONTENT_CALLS"
-case "$*" in
-  *"content://telephony/siminfo"*) cat "$SIMINFO_FIXTURE" ;;
-  *"--projection date "*) printf 'Row: 0 date=1\\n' ;;
-  *"address_hex"*)
-    arguments=$*
-    case "$arguments" in
-      *"--where sub_id="*)
-        sub_id=${arguments#*--where sub_id=}
-        sub_id=${sub_id%% *}
-        grep -F "sub_id=$sub_id," "$HEX_FIXTURE"
-        ;;
-      *) cat "$HEX_FIXTURE" ;;
-    esac
-    ;;
-  *) cat "$FIXTURE" ;;
-esac
+        self.write_command("content", '''#!/usr/bin/python3
+import os
+from pathlib import Path
+import json
+import sqlite3
+import sys
+
+args = sys.argv[1:]
+with open(os.environ["CONTENT_CALLS"], "a", encoding="utf-8") as stream:
+    stream.write(" ".join(args) + "\\n")
+if args[args.index("--uri") + 1] == "content://telephony/siminfo":
+    print(Path(os.environ["SIMINFO_FIXTURE"]).read_text(encoding="utf-8"), end="")
+    sys.exit(0)
+database = sqlite3.connect(":memory:")
+database.execute("CREATE TABLE sms (_id INTEGER, date INTEGER, sub_id INTEGER, address TEXT, body TEXT, type INTEGER)")
+database.executemany("INSERT INTO sms VALUES (?, ?, ?, ?, ?, 1)",
+                     json.loads(Path(os.environ["FIXTURE"]).read_text(encoding="utf-8")))
+projection = args[args.index("--projection") + 1].replace(":", ",")
+where = args[args.index("--where") + 1] if "--where" in args else "1"
+sort = args[args.index("--sort") + 1] if "--sort" in args else "date DESC"
+rows = database.execute(f"SELECT {projection} FROM sms WHERE {where} ORDER BY {sort}")
+names = [column[0] for column in rows.description]
+found = False
+for index, row in enumerate(rows):
+    found = True
+    print(f"Row: {index} " + ", ".join(f"{name}={value}" for name, value in zip(names, row)))
+if not found:
+    print("No result found.")
 ''')
         self.write_command("sleep", '''#!/bin/sh
 printf 'poll\\n' >> "$POLLS"
@@ -113,16 +124,9 @@ exec /bin/sleep "$@"
         self.polls = self.module / "polls"
 
     def write_sms_records(self, records):
-        legacy_rows = []
-        encoded_rows = []
-        for index, (message_id, sms_date, sub_id, address, body) in enumerate(records):
-            legacy_rows.append(
-                f"Row: {index} address={address}, body={body}, date={sms_date}, sub_id={sub_id}\n")
-            encoded_rows.append(
-                f"Row: {index} _id={message_id}, date={sms_date}, sub_id={sub_id}, "
-                f"address_hex={address.encode('utf-8').hex()}, body_hex={body.encode('utf-8').hex()}\n")
-        self.fixture.write_text("".join(legacy_rows), encoding="utf-8")
-        self.hex_fixture.write_text("".join(encoded_rows), encoding="utf-8")
+        pending = self.fixture.with_suffix(".new")
+        pending.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+        pending.replace(self.fixture)
 
     def write_command(self, name, source):
         path = self.commands / name
@@ -130,7 +134,11 @@ exec /bin/sleep "$@"
         path.chmod(0o755)
 
     def cursor(self):
-        return (self.tmp / "last_sms_date.txt").read_text(encoding="utf-8").strip()
+        return self.cursor_file.read_text(encoding="utf-8").strip()
+
+    @property
+    def cursor_file(self):
+        return self.module / "state/sms.cursor"
 
     def startup_config(self, extra=""):
         with (self.module / "core/config.conf").open("a", encoding="utf-8", newline="\n") as stream:
@@ -139,7 +147,7 @@ exec /bin/sleep "$@"
 
     def startup_env(self):
         return dict(os.environ, PATH=f"{self.commands}:{os.environ['PATH']}",
-                    FIXTURE=str(self.fixture), HEX_FIXTURE=str(self.hex_fixture),
+                    FIXTURE=str(self.fixture),
                     SIMINFO_FIXTURE=str(self.siminfo_fixture), CONTENT_CALLS=str(self.content_calls),
                     POLLS=str(self.polls), TZ="Asia/Shanghai")
 
@@ -160,7 +168,7 @@ exec /bin/sleep "$@"
                     output, error = process.communicate(timeout=2)
                     self.assertNotEqual(process.returncode, 0)
                     self.assertIn("错误", (output + error).decode("utf-8"))
-                    self.assertFalse((self.tmp / "last_sms_date.txt").exists())
+                    self.assertFalse(self.cursor_file.exists())
                 finally:
                     if process.poll() is None:
                         os.killpg(process.pid, signal.SIGTERM)
@@ -178,7 +186,7 @@ exec /bin/sleep "$@"
                                             env=self.startup_env(), capture_output=True, timeout=2)
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn("错误", (result.stdout + result.stderr).decode("utf-8"))
-                    self.assertFalse((self.tmp / "last_sms_date.txt").exists())
+                    self.assertFalse(self.cursor_file.exists())
                 finally:
                     hidden.rename(path)
 
@@ -190,8 +198,8 @@ exec /bin/sleep "$@"
         first = subprocess.Popen(command, env=self.startup_env(), start_new_session=True,
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            wait_for(lambda: (self.tmp / "last_sms_date.txt").exists())
-            self.assertEqual(self.cursor(), "1")
+            wait_for(self.cursor_file.exists)
+            self.assertEqual(self.cursor(), "1 1")
             self.assertTrue(log.with_suffix(".log.bak").exists())
             second = subprocess.run(command, env=self.startup_env(), capture_output=True, timeout=2)
             self.assertNotEqual(second.returncode, 0)
@@ -242,7 +250,7 @@ printf 'settings:%s:%s:%s:%s:%s\\n' "$OS_TYPE" "$ENABLE_SMS" "$ENABLE_MISSED_CAL
                                         capture_output=True, timeout=3)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("错误", result.stdout.decode("utf-8"))
-                self.assertFalse((self.tmp / "last_sms_date.txt").exists())
+                self.assertFalse(self.cursor_file.exists())
         (self.module / "core/config.conf").write_text(valid, encoding="utf-8")
         (self.module / "bin/curl").unlink()
         result = subprocess.run(["busybox", "ash", "-c", harness],
@@ -258,7 +266,7 @@ printf 'settings:%s:%s:%s:%s:%s\\n' "$OS_TYPE" "$ENABLE_SMS" "$ENABLE_MISSED_CAL
                                 env=self.startup_env(), capture_output=True, timeout=2)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"content", result.stderr)
-        self.assertFalse((self.tmp / "last_sms_date.txt").exists())
+        self.assertFalse(self.cursor_file.exists())
 
     def test_service_requires_busybox(self):
         script = self.module / "service.sh"
@@ -267,7 +275,7 @@ printf 'settings:%s:%s:%s:%s:%s\\n' "$OS_TYPE" "$ENABLE_SMS" "$ENABLE_MISSED_CAL
         result = subprocess.run(["bash", str(script)], capture_output=True, timeout=2)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"BusyBox", result.stderr)
-        self.assertFalse((self.tmp / "last_sms_date.txt").exists())
+        self.assertFalse(self.cursor_file.exists())
 
     def test_service_boots_single_daemon_with_configured_log(self):
         self.startup_config('MAX_LOG_SIZE_KB=1')
@@ -290,11 +298,11 @@ exec /usr/bin/busybox "$@"
                                            stderr=subprocess.DEVNULL)
                 groups.append(process.pid)
                 self.assertEqual(process.wait(timeout=2), 0)
-                wait_for(lambda: (self.tmp / "last_sms_date.txt").exists())
-            self.assertEqual(self.cursor(), "1")
+                wait_for(self.cursor_file.exists)
+            self.assertEqual(self.cursor(), "1 1")
             self.assertTrue((self.tmp / "sms_forward_run.log.bak").exists())
             self.write_sms_records([(2, 2, 1, "synthetic", BODY)])
-            wait_for(lambda: self.cursor() == "2")
+            wait_for(lambda: self.cursor() == "2 2")
             time.sleep(1.2)
             self.assertEqual(len(self.requests), 1)
             self.assertFalse(list(self.tmp.glob("last_call*")))
@@ -304,6 +312,159 @@ exec /usr/bin/busybox "$@"
                     os.killpg(group, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
+
+    @contextlib.contextmanager
+    def running_daemon(self):
+        process = subprocess.Popen(["bash", str(self.module / "core/sms_daemon.sh")],
+                                   env=self.startup_env(), start_new_session=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            yield process
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=3)
+
+    def test_initial_boundary_skips_history_and_ignores_legacy_state(self):
+        self.startup_config()
+        (self.tmp / "last_sms_date.txt").write_text("999999\n", encoding="utf-8")
+        self.write_sms_records([
+            (9, 100, 1, "synthetic", "history nine"),
+            (99, 999, 2, "synthetic", "other subscription"),
+            (10, 100, 1, "synthetic", "history ten"),
+            (50, 99, 1, "synthetic", "older"),
+        ])
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            self.assertEqual(self.cursor_file.read_bytes(), b"100 10\n")
+            self.assertEqual(self.requests, [])
+            self.assertEqual(self.cursor_file.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(self.cursor_file.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.cursor_file.stat().st_uid, os.getuid())
+
+    def test_empty_initial_boundary_then_new_sms(self):
+        self.startup_config()
+        self.write_sms_records([])
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            self.assertEqual(self.cursor(), "0 0")
+            self.assertEqual(self.requests, [])
+            self.write_sms_records([(2, 100, 1, "synthetic", BODY)])
+            wait_for(lambda: self.cursor() == "100 2")
+            self.assertEqual(len(self.requests), 1)
+
+    def test_initial_query_errors_do_not_create_a_boundary(self):
+        self.startup_config()
+        provider = (self.commands / "content").read_text(encoding="utf-8")
+        for output, code in (("Error while accessing provider", 0), ("", 0),
+                             ("No result found.", 1)):
+            with self.subTest(output=output, code=code):
+                self.polls.unlink(missing_ok=True)
+                self.cursor_file.unlink(missing_ok=True)
+                self.write_command("content", f'''#!/bin/sh
+case "$*" in
+  *siminfo*) cat "$SIMINFO_FIXTURE" ;;
+  *) printf '%s\\n' '{output}'; exit {code} ;;
+esac
+''')
+                with self.running_daemon():
+                    wait_for(self.polls.exists)
+                    self.assertFalse(self.cursor_file.exists())
+                    self.assertEqual(self.requests, [])
+        self.write_command("content", provider)
+        self.polls.unlink(missing_ok=True)
+        self.write_sms_records([(5, 500, 1, "synthetic", "history after recovery")])
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            self.assertEqual(self.cursor(), "500 5")
+            self.assertEqual(self.requests, [])
+
+    def test_equal_timestamps_and_61_records_cross_the_batch_boundary(self):
+        self.startup_config()
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            # Reverse source order so the Provider's sort is significant.
+            self.write_sms_records([(i, 100, 1, "synthetic", f"message {i}")
+                                    for i in range(62, 1, -1)])
+            wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= 2)
+            self.assertEqual(len(self.requests), 50)
+            self.assertEqual(self.cursor(), "100 51")
+            wait_for(lambda: self.cursor() == "100 62")
+            self.assertEqual(len(self.requests), 61)
+            self.assertEqual([json.loads(request[2])["body"].splitlines()[-1]
+                              for request in self.requests],
+                             [f"message {i}" for i in range(2, 63)])
+            self.assertEqual(self.observed_cursors,
+                             ["1 1"] + [f"100 {i}" for i in range(2, 62)])
+            calls = self.content_calls.read_text(encoding="utf-8")
+            self.assertIn("date ASC, _id ASC LIMIT 50", calls)
+            self.assert_no_payload_files_or_sensitive_logs()
+
+    def test_failed_record_stops_batch_and_restart_resumes_saved_cursor(self):
+        self.startup_config()
+        self.reply = lambda count: (200, b'{"code":200}') if count == 1 else (503, b'{}')
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            self.write_sms_records([(i, 100, 1, "synthetic", f"message {i}")
+                                    for i in (2, 3, 4)])
+            wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= 2)
+            self.assertEqual(self.cursor(), "100 2")
+            self.assertEqual(len(self.requests), 2)
+        self.reply = (200, b'{"code":200}')
+        with self.running_daemon():
+            wait_for(lambda: self.cursor() == "100 4")
+            self.assertEqual([json.loads(request[2])["body"].splitlines()[-1]
+                              for request in self.requests],
+                             ["message 2", "message 3", "message 3", "message 4"])
+            self.assert_no_payload_files_or_sensitive_logs()
+
+    def test_invalid_cursor_stops_without_resetting_it(self):
+        self.startup_config()
+        self.cursor_file.parent.mkdir()
+        for value in ("", "1", "-1 2\n", "1 x\n", "1 2 3\n", "1 2\n3 4\n", "1 2\n\n"):
+            with self.subTest(value=value):
+                self.cursor_file.write_text(value, encoding="utf-8")
+                result = subprocess.run(["busybox", "ash", str(self.module / "core/sms_daemon.sh")],
+                                        env=self.startup_env(), capture_output=True, timeout=2)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("进度", result.stderr.decode("utf-8"))
+                self.assertEqual(self.cursor_file.read_text(encoding="utf-8"), value)
+                self.assertEqual(self.requests, [])
+
+    def test_decode_failure_stops_before_later_records(self):
+        self.startup_config()
+        provider = (self.commands / "content").read_text(encoding="utf-8")
+        # An odd-length hex value is a malformed external Provider record.
+        self.write_command("content", provider.replace(
+            'for index, row in enumerate(rows):',
+            'for index, row in enumerate(rows):\n'
+            '    if row[0] == 3 and "body_hex" in names:\n'
+            '        row = (*row[:-1], "A")'))
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            self.write_sms_records([(i, 100, 1, "synthetic", f"message {i}")
+                                    for i in (2, 3, 4)])
+            wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= 2)
+            self.assertEqual(self.cursor(), "100 2")
+            self.assertEqual(len(self.requests), 1)
+
+    def test_commit_failure_stops_before_later_records(self):
+        self.startup_config()
+        pending = self.module / "state/sms.cursor.tmp"
+
+        def block_commit(_):
+            pending.mkdir(exist_ok=True)
+            return 200, b'{"code":200}'
+
+        self.reply = block_commit
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            self.write_sms_records([(i, 100, 1, "synthetic", f"message {i}")
+                                    for i in (2, 3)])
+            wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= 2)
+            self.assertEqual(self.cursor(), "1 1")
+            self.assertEqual(len(self.requests), 1)
+            self.assertIn("进度提交失败", (self.tmp / "sms_forward_run.log").read_text(encoding="utf-8"))
 
     @contextlib.contextmanager
     def daemon(self, subscription_id=1, siminfo=None, initial_new_sms=True):
@@ -331,7 +492,7 @@ INTERVAL=1
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             wait_for(self.polls.exists)
-            self.assertEqual(self.cursor(), "1")
+            self.assertEqual(self.cursor(), "1 1")
             self.assertEqual(self.requests, [])
             if initial_new_sms:
                 self.write_sms_records([(2, 2, subscription_id, "synthetic-sender", BODY)])
@@ -348,12 +509,13 @@ INTERVAL=1
         for secret in (KEY, BODY, "synthetic-sender"):
             self.assertNotIn(secret, log)
         self.assertEqual({path.name for path in self.tmp.iterdir()},
-                         {"sms_forward_run.log", "last_sms_date.txt"})
+                         {"sms_forward_run.log"})
+        self.assertEqual({path.name for path in self.cursor_file.parent.iterdir()}, {"sms.cursor"})
 
     def test_plain_sms_is_one_utf8_json_post(self):
         with self.daemon():
             self.wait_for_attempt()
-            self.assertEqual(self.cursor(), "2")
+            self.assertEqual(self.cursor(), "2 2")
             time.sleep(1.2)
             self.assertEqual(len(self.requests), 1)
             path, headers, payload = self.requests[0]
@@ -369,7 +531,7 @@ INTERVAL=1
         body = "您的验证码是 123456"
         with self.daemon():
             self.write_sms_records([(2, 2, 1, "service", body)])
-            wait_for(lambda: self.cursor() == "2")
+            wait_for(lambda: self.cursor() == "2 2")
             time.sleep(0.1)
             self.assertEqual(len(self.requests), 1)
             data = json.loads(self.requests[0][2].decode("utf-8"))
@@ -388,7 +550,7 @@ INTERVAL=1
                 (2, sms_date, subscription_id, address, body),
                 (1, 1, subscription_id, "synthetic-sender", "history"),
             ])
-            wait_for(lambda: self.cursor() == str(sms_date))
+            wait_for(lambda: self.cursor() == f"{sms_date} 2")
             wait_for(lambda: len(self.requests) == 1)
             data = json.loads(self.requests[0][2].decode("utf-8"))
             received_at = datetime.fromtimestamp(
@@ -415,13 +577,14 @@ INTERVAL=1
             wait_for(lambda: "content://telephony/siminfo" in
                      self.content_calls.read_text(encoding="utf-8"))
             time.sleep(1.2)
-            cursor_file = self.tmp / "last_sms_date.txt"
+            cursor_file = self.cursor_file
             self.assertFalse(cursor_file.exists())
             self.assertEqual(self.requests, [])
             self.assertNotIn("--projection date", self.content_calls.read_text(encoding="utf-8"))
-            cursor_file.write_text("1\n", encoding="utf-8")
+            cursor_file.parent.mkdir(exist_ok=True)
+            cursor_file.write_text("1 1\n", encoding="utf-8")
             time.sleep(1.2)
-            self.assertEqual(self.cursor(), "1")
+            self.assertEqual(self.cursor(), "1 1")
         finally:
             os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=3)
@@ -442,7 +605,7 @@ INTERVAL=1
                     (sms_date, sms_date, 1, "synthetic-sender", body),
                     (1, 1, 1, "synthetic-sender", "history"),
                 ])
-                wait_for(lambda: self.cursor() == str(sms_date))
+                wait_for(lambda: self.cursor() == f"{sms_date} {sms_date}")
                 wait_for(lambda: len(self.requests) == sms_date - 2)
                 data = json.loads(self.requests[-1][2].decode("utf-8"))
                 if code is None:
@@ -470,11 +633,11 @@ INTERVAL=1
                 self.reply = (status, body)
                 # Each process gets a fresh initial boundary.
                 self.polls.unlink(missing_ok=True)
-                (self.tmp / "last_sms_date.txt").unlink(missing_ok=True)
+                self.cursor_file.unlink(missing_ok=True)
                 self.requests.clear()
                 with self.daemon():
                     self.wait_for_attempt()
-                    self.assertEqual(self.cursor(), "1")
+                    self.assertEqual(self.cursor(), "1 1")
                     self.assertEqual(len(self.requests), 1)
                     self.assert_no_payload_files_or_sensitive_logs()
 
@@ -485,7 +648,7 @@ INTERVAL=1
         client.chmod(0o755)
         with self.daemon():
             self.wait_for_attempt()
-            self.assertEqual(self.cursor(), "1")
+            self.assertEqual(self.cursor(), "1 1")
             self.assert_no_payload_files_or_sensitive_logs()
 
     def test_request_timeout_is_bounded_without_internal_retry(self):
@@ -495,7 +658,7 @@ INTERVAL=1
             self.wait_for_attempt()
             self.assertGreater(time.monotonic() - started, 4.5)
             self.assertLess(time.monotonic() - started, 6.5)
-            self.assertEqual(self.cursor(), "1")
+            self.assertEqual(self.cursor(), "1 1")
             self.assertEqual(len(self.requests), 1)
 
     def test_untrusted_certificate_is_rejected(self):
@@ -511,7 +674,7 @@ INTERVAL=1
         self.url = f"https://localhost:{self.server.server_port}/push"
         with self.daemon():
             self.wait_for_attempt()
-            self.assertEqual(self.cursor(), "1")
+            self.assertEqual(self.cursor(), "1 1")
             self.assertEqual(self.requests, [])
 
     def test_remote_http_and_loopback_userinfo_are_rejected(self):
@@ -519,12 +682,12 @@ INTERVAL=1
             with self.subTest(url=url):
                 self.url = url
                 self.polls.unlink(missing_ok=True)
-                (self.tmp / "last_sms_date.txt").unlink(missing_ok=True)
+                self.cursor_file.unlink(missing_ok=True)
                 self.startup_config()
                 result = subprocess.run(["busybox", "ash", str(self.module / "core/sms_daemon.sh")],
                                         env=self.startup_env(), capture_output=True, timeout=2)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertFalse((self.tmp / "last_sms_date.txt").exists())
+                self.assertFalse(self.cursor_file.exists())
                 self.assertEqual(self.requests, [])
 
 

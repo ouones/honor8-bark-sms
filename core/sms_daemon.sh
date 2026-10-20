@@ -29,7 +29,7 @@ esac
 for enabled in "$ENABLE_SMS" "$ENABLE_MISSED_CALL" "$ENABLE_INCOMING_CALL" "$ENABLE_OUTGOING_CALL"; do
     case "$enabled" in true|false) ;; *) startup_error "功能开关必须为 true 或 false" ;; esac
 done
-for tool in awk sed grep head tail tr date wc mv cat touch sleep flock content; do
+for tool in awk sed grep head tail tr date wc mv cat touch sleep flock content mkdir chmod rm; do
     command -v "$tool" >/dev/null 2>&1 || startup_error "缺少必需工具：$tool"
 done
 case "$PUSH_CHANNEL" in
@@ -65,6 +65,8 @@ umask 077
 exec 9>"$BASE_DIR/../sms_daemon.lock" || startup_error "无法打开启动锁"
 flock -n 9 || startup_error "守护进程已在运行"
 LOG_FILE="$TMP_DIR/sms_forward_run.log"
+SMS_STATE_DIR="$BASE_DIR/../state"
+SMS_CURSOR="$SMS_STATE_DIR/sms.cursor"
 
 # ================= 核心工具函数 =================
 
@@ -162,22 +164,48 @@ send_to_webhook() {
     fi
 }
 
-init_timestamp() {
-    local uri=$1
-    local where_cond=$2
-    local record_file=$3
-    if [ ! -f "$record_file" ]; then
-        local raw_data=""
-        if [ -n "$where_cond" ]; then
-            raw_data=$(content query --uri "$uri" --projection date --where "$where_cond" --sort "date DESC" 2>/dev/null | head -n 1)
-        else
-            raw_data=$(content query --uri "$uri" --projection date --sort "date DESC" 2>/dev/null | head -n 1)
-        fi
-        local init_date=$(echo "$raw_data" | sed -n 's/.*date=\([^,]*\).*/\1/p' | tr -cd '0-9')
-        [ -z "$init_date" ] && init_date=0
-        echo "$init_date" > "$record_file"
-        log_msg "INFO" "初始化时间戳: $record_file -> $init_date"
+read_sms_cursor() {
+    awk '
+    NR != 1 || $0 !~ /^[0-9]+ [0-9]+$/ { invalid = 1 }
+    END {
+        if (NR != 1 || invalid) exit 1
+        sub(/^0+/, "", $1); sub(/^0+/, "", $2)
+        print ($1 == "" ? "0" : $1), ($2 == "" ? "0" : $2)
+    }' "$SMS_CURSOR"
+}
+
+commit_sms_cursor() {
+    local pending="$SMS_STATE_DIR/sms.cursor.tmp"
+    if printf '%s %s\n' "$1" "$2" > "$pending" && chmod 600 "$pending" &&
+        mv -f "$pending" "$SMS_CURSOR"; then
+        return 0
     fi
+    rm -f "$pending"
+    log_msg "ERROR" "短信进度提交失败"
+    return 1
+}
+
+query_sms_rows() {
+    local raw
+    raw=$(content query --uri "$1" --projection "$2" --where "$3" --sort "$4" 2>&1) || {
+        log_msg "ERROR" "短信查询失败"
+        return 1
+    }
+    # content 可能在退出码为0时打印错误；只有明确的空结果或完整行才有效。
+    if [ "$raw" = "No result found." ]; then
+        return 0
+    fi
+    if ! printf '%s\n' "$raw" | awk -v metadata="$5" '
+    metadata == "boundary" {
+        if ($0 !~ /^Row: [0-9]+ _id=[0-9]+, date=[0-9]+$/) exit 1
+        next
+    }
+    $0 !~ /^Row: [0-9]+ _id=[0-9]+, date=[0-9]+, sub_id=[0-9]+, address_hex=[0-9A-Fa-f]*, body_hex=[0-9A-Fa-f]*$/ { exit 1 }
+    '; then
+        log_msg "ERROR" "短信查询结果无效"
+        return 1
+    fi
+    printf '%s\n' "$raw"
 }
 
 # ================= 业务逻辑函数 =================
@@ -215,10 +243,15 @@ hex_to_utf8() {
 }
 
 check_sms() {
+    local cursor last_date last_id
+    if [ -e "$SMS_CURSOR" ]; then
+        cursor=$(read_sms_cursor) || startup_error "短信进度无效，已停止"
+        last_date=${cursor% *}
+        last_id=${cursor#* }
+    fi
     local sim1_sub_id
     sim1_sub_id=$(get_sim1_sub_id) || return 1
     [ -n "$sim1_sub_id" ] || return 1
-    local record_file="$TMP_DIR/last_sms_date.txt"
     local sms_uri="content://sms/inbox"
     local where_cond="sub_id=$sim1_sub_id"
     
@@ -227,14 +260,27 @@ check_sms() {
         where_cond="type=1 AND sub_id=$sim1_sub_id"
     fi
 
-    init_timestamp "$sms_uri" "$where_cond" "$record_file"
-    local last_date=$(cat "$record_file" | tr -cd '0-9')
-    [ -z "$last_date" ] && last_date=0
-    
-    local raw_sms=""
-    raw_sms=$(content query --uri "$sms_uri" --projection "date:sub_id:hex(address) AS address_hex:hex(body) AS body_hex" --where "$where_cond" --sort "date DESC" 2>/dev/null | head -n 1)
+    local rows
+    if [ -z "$cursor" ]; then
+        rows=$(query_sms_rows "$sms_uri" "_id:date" "$where_cond" "date DESC, _id DESC LIMIT 1" boundary) || return 1
+        if [ -z "$rows" ]; then
+            commit_sms_cursor 0 0
+        else
+            last_id=${rows#*_id=}
+            last_id=${last_id%%,*}
+            last_date=${rows##*date=}
+            commit_sms_cursor "$last_date" "$last_id"
+        fi
+        return $?
+    fi
+    rows=$(query_sms_rows "$sms_uri" "_id:date:sub_id:hex(address) AS address_hex:hex(body) AS body_hex" \
+        "$where_cond AND (date>$last_date OR (date=$last_date AND _id>$last_id))" \
+        "date ASC, _id ASC LIMIT 50") || return 1
+    [ -n "$rows" ] || return 0
 
-    if [ -n "$raw_sms" ]; then
+    printf '%s\n' "$rows" | while IFS= read -r raw_sms; do
+        local sms_id=${raw_sms#*_id=}
+        sms_id=${sms_id%%,*}
         local address_hex=$(printf '%s\n' "$raw_sms" | sed -n 's/.*address_hex=\([[:xdigit:]]*\).*/\1/p')
         local body_hex=$(printf '%s\n' "$raw_sms" | sed -n 's/.*body_hex=\([[:xdigit:]]*\).*/\1/p')
         local address
@@ -246,7 +292,8 @@ check_sms() {
         local sms_date=$(printf '%s\n' "$raw_sms" | sed -n 's/.*date=\([0-9][0-9]*\).*/\1/p')
         local sub_id=$(echo "$raw_sms" | sed -n 's/.*sub_id=\([^,]*\).*/\1/p')
 
-        if [ "$sub_id" = "$sim1_sub_id" ] && [ -n "$sms_date" ] && [ "$sms_date" -gt "$last_date" ]; then
+        if [ "$sub_id" = "$sim1_sub_id" ] && { [ "$sms_date" -gt "$last_date" ] ||
+            { [ "$sms_date" -eq "$last_date" ] && [ "$sms_id" -gt "$last_id" ]; }; }; then
             local sim_tag="未知"
             [ "$sub_id" = "1" ] || [ "$sub_id" = "0" ] && sim_tag="卡1"
             [ "$sub_id" = "2" ] && sim_tag="卡2"
@@ -273,26 +320,26 @@ check_sms() {
 接收时间：$received_at
 短信内容：
 $body"
-                if send_to_webhook "$bark_title" "$bark_body" "$vcode"; then
-                    echo "$sms_date" > "$record_file"
-                fi
+                send_to_webhook "$bark_title" "$bark_body" "$vcode" || return 1
             elif [ -n "$vcode" ]; then
                 local cb='```'
                 local detail_msg="### 💬 ${KEYWORD_SMS} 详情\n\n---\n- **卡槽**: ${sim_tag}\n- **发件人**: ${address}\n- **内容**: ${body}"
-                send_to_webhook "${KEYWORD_SMS}" "$detail_msg"
+                send_to_webhook "${KEYWORD_SMS}" "$detail_msg" || return 1
                 
                 local vcode_msg="${cb}text\n${vcode}\n${cb}"
-                if send_to_webhook "${KEYWORD_SMS}" "$vcode_msg"; then
-                    echo "$sms_date" > "$record_file"
-                fi
+                send_to_webhook "${KEYWORD_SMS}" "$vcode_msg" || return 1
             else
                 local normal_msg="### 💬 ${KEYWORD_SMS}\n\n---\n- **卡槽**: ${sim_tag}\n- **发件人**: ${address}\n- **内容**: ${body}"
-                if send_to_webhook "${KEYWORD_SMS}" "$normal_msg"; then
-                    echo "$sms_date" > "$record_file"
-                fi
+                send_to_webhook "${KEYWORD_SMS}" "$normal_msg" || return 1
             fi
+            commit_sms_cursor "$sms_date" "$sms_id" || return 1
+            last_date=$sms_date
+            last_id=$sms_id
+        else
+            log_msg "ERROR" "短信记录顺序或订阅无效"
+            return 1
         fi
-    fi
+    done
 }
 
 check_call_log() {
@@ -334,6 +381,13 @@ check_call_log() {
 touch "$LOG_FILE" || startup_error "无法写入日志"
 log_msg "INFO" "========================================="
 log_msg "INFO" "通信转发守护进程启动"
+if [ "$ENABLE_SMS" = "true" ]; then
+    mkdir -p "$SMS_STATE_DIR" && chmod 700 "$SMS_STATE_DIR" || startup_error "无法创建短信进度目录"
+    if [ -e "$SMS_CURSOR" ]; then
+        [ -f "$SMS_CURSOR" ] && read_sms_cursor >/dev/null || startup_error "短信进度无效，已停止"
+        chmod 600 "$SMS_CURSOR" || startup_error "无法设置短信进度权限"
+    fi
+fi
 
 # ================= 守护进程主循环 =================
 
