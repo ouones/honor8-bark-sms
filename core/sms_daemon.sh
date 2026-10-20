@@ -33,7 +33,58 @@ escape_json() {
     echo "$1" | awk '{gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); printf "%s\\n", $0}' | sed 's/\\n$//'
 }
 
+send_to_bark() {
+    local client="$BASE_DIR/../bin/curl"
+    local json="$BASE_DIR/../bin/jq"
+    local ca="$BASE_DIR/../bin/cacert.pem"
+    local payload response http_code authority port
+
+    if [ -z "$BARK_DEVICE_KEY" ] || [ ! -x "$client" ] || [ ! -x "$json" ] || [ ! -r "$ca" ]; then
+        log_msg "ERROR" "Bark 配置或依赖缺失"
+        return 1
+    fi
+    # 外网仅允许 HTTPS；回环 HTTP 供隔离接收服务验证使用。
+    case "$BARK_API_URL" in
+        https://*) ;;
+        http://127.0.0.1:*/*|http://localhost:*/*)
+            authority=${BARK_API_URL#http://}
+            authority=${authority%%/*}
+            port=${authority#*:}
+            case "$port" in
+                ''|*[!0-9]*) log_msg "ERROR" "Bark 回环端点无效"; return 1 ;;
+            esac ;;
+        *) log_msg "ERROR" "Bark 端点须使用 HTTPS"; return 1 ;;
+    esac
+
+    # NUL 分隔字段，内容只经过内存和管道，不放入命令参数或载荷文件。
+    payload=$(
+        { printf '%s\000' "$BARK_DEVICE_KEY" "$1"; printf '%s' "$2"; } |
+            "$json" -Rsc 'split("\u0000") | {device_key: .[0], title: .[1], body: .[2]}' 2>/dev/null
+    ) || { log_msg "ERROR" "Bark JSON 编码失败"; return 1; }
+
+    # -q 禁用外部 curlrc，避免环境配置关闭证书验证或加入内部重试。
+    if ! response=$(printf '%s' "$payload" | "$client" -q -s \
+        --connect-timeout 3 --max-time 5 --cacert "$ca" --proto '=http,https' \
+        -H 'Content-Type: application/json; charset=utf-8' \
+        --data-binary @- -w '\n%{http_code}' --url "$BARK_API_URL" 2>/dev/null); then
+        log_msg "ERROR" "Bark 客户端传输失败"
+        return 1
+    fi
+    http_code=$(printf '%s\n' "$response" | tail -n 1)
+    if [ "$http_code" = "200" ] && printf '%s\n' "$response" | sed '$d' |
+        "$json" -es 'length == 1 and (.[0] | type == "object" and .code == 200)' >/dev/null 2>&1; then
+        log_msg "SUCCESS" "Bark 服务确认成功"
+        return 0
+    fi
+    log_msg "ERROR" "Bark HTTP 或业务响应失败"
+    return 1
+}
+
 send_to_webhook() {
+    if [ "${PUSH_CHANNEL:-DingTalk}" = "Bark" ]; then
+        send_to_bark "$1" "$2"
+        return $?
+    fi
     # 强制在标题加入“通知”二字，突破钉钉拦截
     local safe_title=$(escape_json "【通知】$1") 
     local safe_text=$(escape_json "$2")
@@ -107,7 +158,11 @@ check_sms() {
             [ "$sub_id" = "1" ] || [ "$sub_id" = "0" ] && sim_tag="卡1"
             [ "$sub_id" = "2" ] && sim_tag="卡2"
 
-            log_msg "INFO" "捕获新短信 -> 号码: $address"
+            if [ "$PUSH_CHANNEL" = "Bark" ]; then
+                log_msg "INFO" "捕获新短信"
+            else
+                log_msg "INFO" "捕获新短信 -> 号码: $address"
+            fi
             
             # 防贪婪精准提取补丁
             local safe_body=" $body"
