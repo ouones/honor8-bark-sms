@@ -2,13 +2,69 @@
 # /data/adb/modules/hyperos_sms_forwarder/core/sms_daemon.sh
 # 备用机全方位通信底层转发 (V1 稳定双气泡 + 万能关键词 + 完美日志版)
 
-BASE_DIR=$(dirname $(readlink -f "$0"))
+BASE_DIR=$(dirname "$(readlink -f "$0")")
 CONFIG_FILE="$BASE_DIR/config.conf"
 
-# 💡 补回缺失的目录和日志定义
-TMP_DIR=${TMP_DIR:-"/data/local/tmp"}
+# 在派生路径及日志上限生效前读取配置，所有校验均早于进度初始化。
+startup_error() {
+    printf '启动错误：%s\n' "$1" >&2
+    exit 1
+}
+
+[ -r "$CONFIG_FILE" ] || startup_error "找不到配置文件"
+. "$CONFIG_FILE" || startup_error "配置读取失败"
+case "$INTERVAL" in
+    ''|0*|*[!0-9]*) startup_error "INTERVAL 必须为正整数" ;;
+esac
+case "$MAX_LOG_SIZE_KB" in
+    ''|0*|*[!0-9]*) startup_error "MAX_LOG_SIZE_KB 必须为正整数" ;;
+esac
+if [ -z "$TMP_DIR" ] || [ ! -d "$TMP_DIR" ] || [ ! -w "$TMP_DIR" ]; then
+    startup_error "TMP_DIR 目录不可写"
+fi
+case "$OS_TYPE" in
+    EMUI|ColorOS|HyperOS|MIUI) ;;
+    *) startup_error "OS_TYPE 无效" ;;
+esac
+for enabled in "$ENABLE_SMS" "$ENABLE_MISSED_CALL" "$ENABLE_INCOMING_CALL" "$ENABLE_OUTGOING_CALL"; do
+    case "$enabled" in true|false) ;; *) startup_error "功能开关必须为 true 或 false" ;; esac
+done
+for tool in awk sed grep head tail tr date wc mv cat touch sleep flock content; do
+    command -v "$tool" >/dev/null 2>&1 || startup_error "缺少必需工具：$tool"
+done
+case "$PUSH_CHANNEL" in
+    Bark)
+        [ -n "$BARK_DEVICE_KEY" ] || startup_error "缺少 BARK_DEVICE_KEY"
+        case "$BARK_API_URL" in
+            *[[:space:][:cntrl:]]*|https:///*|https://:*) startup_error "BARK_API_URL 格式无效" ;;
+        esac
+        case "$BARK_API_URL" in
+            https://?*/*) ;;
+            http://127.0.0.1:*/*|http://localhost:*/*)
+                authority=${BARK_API_URL#http://}
+                authority=${authority%%/*}
+                port=${authority#*:}
+                case "$port" in ''|*[!0-9]*) startup_error "Bark 回环端点无效" ;; esac ;;
+            *) startup_error "BARK_API_URL 须为完整 HTTPS 端点" ;;
+        esac
+        if [ ! -x "$BASE_DIR/../bin/curl" ] || [ ! -x "$BASE_DIR/../bin/jq" ] || [ ! -r "$BASE_DIR/../bin/cacert.pem" ]; then
+            startup_error "Bark 客户端或证书缺失"
+        fi
+        ;;
+    DingTalk)
+        if [ -z "$WEBHOOK_URL" ] || [ "$WEBHOOK_URL" = "https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN_HERE" ]; then
+            startup_error "缺少 WEBHOOK_URL"
+        fi
+        command -v curl >/dev/null 2>&1 || startup_error "缺少 curl"
+        ;;
+    *) startup_error "PUSH_CHANNEL 无效" ;;
+esac
+
+# 锁文件保持原 inode，禁止删除；进程退出时由内核释放锁。
+umask 077
+exec 9>"$BASE_DIR/../sms_daemon.lock" || startup_error "无法打开启动锁"
+flock -n 9 || startup_error "守护进程已在运行"
 LOG_FILE="$TMP_DIR/sms_forward_run.log"
-MAX_LOG_SIZE_KB=${MAX_LOG_SIZE_KB:-1024}
 
 # ================= 核心工具函数 =================
 
@@ -225,15 +281,9 @@ check_call_log() {
 
 # ================= 启动准备 =================
 
-if [ -f "$CONFIG_FILE" ]; then
-    source "$CONFIG_FILE"
-    touch "$LOG_FILE"
-    log_msg "INFO" "========================================="
-    log_msg "INFO" "通信转发守护进程启动 [完美日志修复版]"
-else
-    echo "致命错误：找不到配置文件 $CONFIG_FILE"
-    exit 1
-fi
+touch "$LOG_FILE" || startup_error "无法写入日志"
+log_msg "INFO" "========================================="
+log_msg "INFO" "通信转发守护进程启动"
 
 # ================= 守护进程主循环 =================
 

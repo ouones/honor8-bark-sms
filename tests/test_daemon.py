@@ -100,6 +100,177 @@ exec /bin/sleep "$@"
     def cursor(self):
         return (self.tmp / "last_sms_date.txt").read_text(encoding="utf-8").strip()
 
+    def startup_config(self, extra=""):
+        with (self.module / "core/config.conf").open("a", encoding="utf-8", newline="\n") as stream:
+            stream.write(f'\nBARK_API_URL="{self.url}"\nBARK_DEVICE_KEY="{KEY}"\n'
+                         f'TMP_DIR="{self.tmp}"\nINTERVAL=1\n{extra}\n')
+
+    def startup_env(self):
+        return dict(os.environ, PATH=f"{self.commands}:{os.environ['PATH']}",
+                    FIXTURE=str(self.fixture), POLLS=str(self.polls))
+
+    def test_invalid_startup_never_initializes_progress(self):
+        original = (self.module / "core/config.conf").read_text(encoding="utf-8")
+        for extra in ('BARK_DEVICE_KEY=""', 'INTERVAL=0', 'INTERVAL=-1',
+                      'INTERVAL=abc', 'INTERVAL=1.5', 'MAX_LOG_SIZE_KB=bad',
+                      'ENABLE_SMS=maybe', 'PUSH_CHANNEL=unknown', 'OS_TYPE=""',
+                      'BARK_API_URL=""', 'BARK_API_URL="https://bad host/push"',
+                      'BARK_API_URL="https://:443/push"', 'BARK_API_URL="https:////push"'):
+            with self.subTest(extra=extra):
+                (self.module / "core/config.conf").write_text(original, encoding="utf-8")
+                self.startup_config(extra)
+                process = subprocess.Popen(["busybox", "ash", str(self.module / "core/sms_daemon.sh")],
+                                           env=self.startup_env(), start_new_session=True,
+                                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    output, error = process.communicate(timeout=2)
+                    self.assertNotEqual(process.returncode, 0)
+                    self.assertIn("错误", (output + error).decode("utf-8"))
+                    self.assertFalse((self.tmp / "last_sms_date.txt").exists())
+                finally:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        process.communicate()
+
+    def test_missing_bark_dependencies_fail_before_progress(self):
+        self.startup_config()
+        for name in ("curl", "jq", "cacert.pem"):
+            with self.subTest(name=name):
+                path = self.module / "bin" / name
+                hidden = path.with_suffix(".hidden")
+                path.rename(hidden)
+                try:
+                    result = subprocess.run(["busybox", "ash", str(self.module / "core/sms_daemon.sh")],
+                                            env=self.startup_env(), capture_output=True, timeout=2)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("错误", (result.stdout + result.stderr).decode("utf-8"))
+                    self.assertFalse((self.tmp / "last_sms_date.txt").exists())
+                finally:
+                    hidden.rename(path)
+
+    def test_configured_log_rotation_and_single_instance(self):
+        self.startup_config('MAX_LOG_SIZE_KB=1')
+        log = self.tmp / "sms_forward_run.log"
+        log.write_text("x" * 1100, encoding="utf-8")
+        command = ["busybox", "ash", str(self.module / "core/sms_daemon.sh")]
+        first = subprocess.Popen(command, env=self.startup_env(), start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            wait_for(lambda: (self.tmp / "last_sms_date.txt").exists())
+            self.assertEqual(self.cursor(), "1")
+            self.assertTrue(log.with_suffix(".log.bak").exists())
+            second = subprocess.run(command, env=self.startup_env(), capture_output=True, timeout=2)
+            self.assertNotEqual(second.returncode, 0)
+            self.assertIn("运行", second.stderr.decode("utf-8"))
+            self.assertIsNone(first.poll())
+        finally:
+            os.killpg(first.pid, signal.SIGTERM)
+            first.wait(timeout=3)
+        # Kernel lock is released after termination; no stale PID cleanup required.
+        restarted = subprocess.Popen(command, env=self.startup_env(), start_new_session=True,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(1.2)
+            self.assertIsNone(restarted.poll())
+        finally:
+            os.killpg(restarted.pid, signal.SIGTERM)
+            restarted.wait(timeout=3)
+
+    def test_bark_install_preserves_honor8_settings_without_keys(self):
+        self.startup_config('BARK_API_URL="https://example.invalid/push"')
+        # Map only the absolute external BusyBox executable on the host.
+        (self.module / "customize.sh").write_text(
+            (ROOT / "customize.sh").read_text(encoding="utf-8").replace(
+                "/data/adb/magisk/busybox", shutil.which("busybox")), encoding="utf-8")
+        self.write_command("getevent", '#!/bin/sh\necho unexpected-key-read >&2\nexit 1\n')
+        harness = '''ui_print() { printf '%s\\n' "$*"; }
+abort() { ui_print "$*"; exit 1; }
+set_perm_recursive() { :; }
+set_perm() { :; }
+. "$MODPATH/customize.sh"
+. "$MODPATH/core/config.conf"
+printf 'settings:%s:%s:%s:%s:%s\\n' "$OS_TYPE" "$ENABLE_SMS" "$ENABLE_MISSED_CALL" "$ENABLE_INCOMING_CALL" "$ENABLE_OUTGOING_CALL"
+'''
+        result = subprocess.run(["busybox", "ash", "-c", harness],
+                                env=dict(self.startup_env(), MODPATH=str(self.module)),
+                                capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(b"settings:EMUI:true:false:false:false", result.stdout)
+        self.assertNotIn(b"unexpected-key-read", result.stderr)
+        valid = (self.module / "core/config.conf").read_text(encoding="utf-8")
+        for extra in ('BARK_DEVICE_KEY=""', 'BARK_API_URL=""', 'INTERVAL=0',
+                      'BARK_API_URL="https://bad host/push"',
+                      'BARK_API_URL="https://:443/push"', 'BARK_API_URL="https:////push"'):
+            with self.subTest(extra=extra):
+                (self.module / "core/config.conf").write_text(valid + "\n" + extra + "\n", encoding="utf-8")
+                result = subprocess.run(["busybox", "ash", "-c", harness],
+                                        env=dict(self.startup_env(), MODPATH=str(self.module)),
+                                        capture_output=True, timeout=3)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("错误", result.stdout.decode("utf-8"))
+                self.assertFalse((self.tmp / "last_sms_date.txt").exists())
+        (self.module / "core/config.conf").write_text(valid, encoding="utf-8")
+        (self.module / "bin/curl").unlink()
+        result = subprocess.run(["busybox", "ash", "-c", harness],
+                                env=dict(self.startup_env(), MODPATH=str(self.module)),
+                                capture_output=True, timeout=3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("依赖错误", result.stdout.decode("utf-8"))
+
+    def test_missing_provider_tool_fails_before_progress(self):
+        self.startup_config()
+        (self.commands / "content").unlink()
+        result = subprocess.run(["busybox", "ash", str(self.module / "core/sms_daemon.sh")],
+                                env=self.startup_env(), capture_output=True, timeout=2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"content", result.stderr)
+        self.assertFalse((self.tmp / "last_sms_date.txt").exists())
+
+    def test_service_requires_busybox(self):
+        script = self.module / "service.sh"
+        script.write_text((ROOT / "service.sh").read_text(encoding="utf-8").replace(
+            "/data/adb/magisk/busybox", str(self.module / "missing-busybox")), encoding="utf-8")
+        result = subprocess.run(["bash", str(script)], capture_output=True, timeout=2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"BusyBox", result.stderr)
+        self.assertFalse((self.tmp / "last_sms_date.txt").exists())
+
+    def test_service_boots_single_daemon_with_configured_log(self):
+        self.startup_config('MAX_LOG_SIZE_KB=1')
+        # Ubuntu's trimmed BusyBox omits nohup; map that external applet only.
+        self.write_command("magisk-busybox", '''#!/bin/sh
+if [ "$1" = nohup ]; then shift; exec /usr/bin/nohup "$@"; fi
+exec /usr/bin/busybox "$@"
+''')
+        script = self.module / "service.sh"
+        script.write_text((ROOT / "service.sh").read_text(encoding="utf-8").replace(
+            "/data/adb/magisk/busybox", str(self.commands / "magisk-busybox")), encoding="utf-8")
+        self.write_command("getprop", '#!/bin/sh\nprintf "1\\n"\n')
+        self.write_command("sleep", '#!/bin/sh\nexit 0\n')
+        (self.tmp / "sms_forward_run.log").write_text("x" * 1100, encoding="utf-8")
+        groups = []
+        try:
+            for _ in range(2):
+                process = subprocess.Popen(["bash", str(script)], env=self.startup_env(),
+                                           start_new_session=True, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL)
+                groups.append(process.pid)
+                self.assertEqual(process.wait(timeout=2), 0)
+                wait_for(lambda: (self.tmp / "last_sms_date.txt").exists())
+            self.assertEqual(self.cursor(), "1")
+            self.assertTrue((self.tmp / "sms_forward_run.log.bak").exists())
+            self.fixture.write_text(f"Row: 0 address=synthetic, body={BODY}, date=2, sub_id=1\n", encoding="utf-8")
+            wait_for(lambda: self.cursor() == "2")
+            time.sleep(1.2)
+            self.assertEqual(len(self.requests), 1)
+            self.assertFalse(list(self.tmp.glob("last_call*")))
+        finally:
+            for group in groups:
+                try:
+                    os.killpg(group, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
     @contextlib.contextmanager
     def daemon(self):
         self.fixture.write_text("Row: 0 address=synthetic-sender, body=history, date=1, sub_id=1\n", encoding="utf-8")
@@ -226,10 +397,12 @@ INTERVAL=1
                 self.url = url
                 self.polls.unlink(missing_ok=True)
                 (self.tmp / "last_sms_date.txt").unlink(missing_ok=True)
-                with self.daemon():
-                    self.wait_for_attempt()
-                    self.assertEqual(self.cursor(), "1")
-                    self.assertEqual(self.requests, [])
+                self.startup_config()
+                result = subprocess.run(["busybox", "ash", str(self.module / "core/sms_daemon.sh")],
+                                        env=self.startup_env(), capture_output=True, timeout=2)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((self.tmp / "last_sms_date.txt").exists())
+                self.assertEqual(self.requests, [])
 
 
 if __name__ == "__main__":

@@ -5,16 +5,33 @@ ui_print "*********************************************"
 ui_print "   备用机全能通信转发 - 交互式安装向导   "
 ui_print "*********************************************"
 
-# --- 1. Webhook 防呆校验 (必须保留) ---
+# --- 1. 按渠道校验配置与离线依赖 ---
 CONFIG_FILE="$MODPATH/core/config.conf"
-HOOK_CHECK=$(grep "WEBHOOK_URL=" "$CONFIG_FILE" | cut -d '"' -f 2)
-
-if [ "$HOOK_CHECK" = "https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN_HERE" ] || [ -z "$HOOK_CHECK" ]; then
+[ -r "$CONFIG_FILE" ] || abort "配置错误：找不到 config.conf"
+. "$CONFIG_FILE" || abort "配置错误：无法读取 config.conf"
+[ -x /data/adb/magisk/busybox ] || abort "依赖错误：缺少 Magisk BusyBox"
+case "$INTERVAL" in ''|0*|*[!0-9]*) abort "配置错误：INTERVAL 必须为正整数" ;; esac
+case "$PUSH_CHANNEL" in
+    Bark)
+        [ -n "$BARK_DEVICE_KEY" ] || abort "配置错误：缺少 BARK_DEVICE_KEY"
+        case "$BARK_API_URL" in
+            *[[:space:][:cntrl:]]*|https:///*|https://:*) abort "配置错误：BARK_API_URL 格式无效" ;;
+        esac
+        case "$BARK_API_URL" in https://?*/*) ;; *) abort "配置错误：请填写完整 Bark HTTPS POST 端点" ;; esac
+        if [ ! -f "$MODPATH/bin/curl" ] || [ ! -f "$MODPATH/bin/jq" ] || [ ! -r "$MODPATH/bin/cacert.pem" ]; then
+            abort "依赖错误：缺少 Bark 客户端或证书"
+        fi
+        ;;
+    DingTalk)
+if [ "$WEBHOOK_URL" = "https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN_HERE" ] || [ -z "$WEBHOOK_URL" ]; then
     ui_print " ❌ 拦截安装：未配置 Webhook 地址！"
     ui_print "请先解压，在 core/config.conf 中填入你的 Webhook"
     ui_print "然后重新打包为 ZIP 再刷入！"
     abort "安装已终止。"
 fi
+        ;;
+    *) abort "配置错误：未知 PUSH_CHANNEL" ;;
+esac
 
 # --- 2. 按键捕获引擎 ---
 ui_print "- 正在初始化按键检测环境..."
@@ -41,6 +58,14 @@ set_config() {
     sed -i "s/^${key}=.*/${key}=${value}/g" "$CONFIG_FILE"
 }
 
+if [ "$PUSH_CHANNEL" = "Bark" ]; then
+    ui_print "- 使用荣耀8配置：EMUI、短信开启、全部通话监控关闭。"
+    set_config "OS_TYPE" '"EMUI"'
+    set_config "ENABLE_SMS" "true"
+    set_config "ENABLE_MISSED_CALL" "false"
+    set_config "ENABLE_INCOMING_CALL" "false"
+    set_config "ENABLE_OUTGOING_CALL" "false"
+else
 ui_print " "
 ui_print "👉 请按一次【音量上】或【音量下】测试按键..."
 TEST_KEY=$(get_key)
@@ -125,9 +150,16 @@ fi
 sleep 1
 
 # --- 4. 权限赋予与收尾 ---
+fi
 ui_print " "
 ui_print "- 正在保存配置并应用权限..."
-set_perm_recursive $MODPATH/core 0 0 0755 0755
+set_perm_recursive "$MODPATH/core" 0 0 0755 0755
+set_perm "$CONFIG_FILE" 0 0 0600
+if [ "$PUSH_CHANNEL" = "Bark" ]; then
+    set_perm_recursive "$MODPATH/bin" 0 0 0755 0644
+    set_perm "$MODPATH/bin/curl" 0 0 0755
+    set_perm "$MODPATH/bin/jq" 0 0 0755
+fi
 ui_print " "
 ui_print "🎉 安装完成！所有自定义选项已写入。"
 ui_print "重启后探针将自动在后台工作。"
