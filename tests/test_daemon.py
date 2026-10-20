@@ -5,6 +5,7 @@ Only external commands and the HTTP service are replaced; the daemon is real.
 """
 
 import contextlib
+from datetime import datetime
 import http.server
 import json
 import os
@@ -17,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from zoneinfo import ZoneInfo
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,9 +80,28 @@ class DaemonTest(unittest.TestCase):
         self.addCleanup(self.server_thread.join)
         self.addCleanup(self.server.shutdown)
         self.url = f"http://127.0.0.1:{self.server.server_port}/custom/push"
+        self.fixture = self.module / "synthetic-provider.txt"
+        self.hex_fixture = self.module / "synthetic-provider-hex.txt"
+        self.siminfo_fixture = self.module / "synthetic-siminfo.txt"
+        self.content_calls = self.module / "content-calls.txt"
+        self.siminfo_fixture.write_text("Row: 0 _id=1, sim_id=0\n", encoding="utf-8")
+        self.content_calls.write_text("", encoding="utf-8")
         self.write_command("content", '''#!/bin/sh
+printf '%s\\n' "$*" >> "$CONTENT_CALLS"
 case "$*" in
+  *"content://telephony/siminfo"*) cat "$SIMINFO_FIXTURE" ;;
   *"--projection date "*) printf 'Row: 0 date=1\\n' ;;
+  *"address_hex"*)
+    arguments=$*
+    case "$arguments" in
+      *"--where sub_id="*)
+        sub_id=${arguments#*--where sub_id=}
+        sub_id=${sub_id%% *}
+        grep -F "sub_id=$sub_id," "$HEX_FIXTURE"
+        ;;
+      *) cat "$HEX_FIXTURE" ;;
+    esac
+    ;;
   *) cat "$FIXTURE" ;;
 esac
 ''')
@@ -88,9 +109,20 @@ esac
 printf 'poll\\n' >> "$POLLS"
 exec /bin/sleep "$@"
 ''')
-        self.fixture = self.module / "synthetic-provider.txt"
-        self.fixture.write_text("Row: 0 address=synthetic-sender, body=history, date=1, sub_id=1\n", encoding="utf-8")
+        self.write_sms_records([(1, 1, 1, "synthetic-sender", "history")])
         self.polls = self.module / "polls"
+
+    def write_sms_records(self, records):
+        legacy_rows = []
+        encoded_rows = []
+        for index, (message_id, sms_date, sub_id, address, body) in enumerate(records):
+            legacy_rows.append(
+                f"Row: {index} address={address}, body={body}, date={sms_date}, sub_id={sub_id}\n")
+            encoded_rows.append(
+                f"Row: {index} _id={message_id}, date={sms_date}, sub_id={sub_id}, "
+                f"address_hex={address.encode('utf-8').hex()}, body_hex={body.encode('utf-8').hex()}\n")
+        self.fixture.write_text("".join(legacy_rows), encoding="utf-8")
+        self.hex_fixture.write_text("".join(encoded_rows), encoding="utf-8")
 
     def write_command(self, name, source):
         path = self.commands / name
@@ -107,7 +139,9 @@ exec /bin/sleep "$@"
 
     def startup_env(self):
         return dict(os.environ, PATH=f"{self.commands}:{os.environ['PATH']}",
-                    FIXTURE=str(self.fixture), POLLS=str(self.polls))
+                    FIXTURE=str(self.fixture), HEX_FIXTURE=str(self.hex_fixture),
+                    SIMINFO_FIXTURE=str(self.siminfo_fixture), CONTENT_CALLS=str(self.content_calls),
+                    POLLS=str(self.polls), TZ="Asia/Shanghai")
 
     def test_invalid_startup_never_initializes_progress(self):
         original = (self.module / "core/config.conf").read_text(encoding="utf-8")
@@ -259,7 +293,7 @@ exec /usr/bin/busybox "$@"
                 wait_for(lambda: (self.tmp / "last_sms_date.txt").exists())
             self.assertEqual(self.cursor(), "1")
             self.assertTrue((self.tmp / "sms_forward_run.log.bak").exists())
-            self.fixture.write_text(f"Row: 0 address=synthetic, body={BODY}, date=2, sub_id=1\n", encoding="utf-8")
+            self.write_sms_records([(2, 2, 1, "synthetic", BODY)])
             wait_for(lambda: self.cursor() == "2")
             time.sleep(1.2)
             self.assertEqual(len(self.requests), 1)
@@ -272,8 +306,11 @@ exec /usr/bin/busybox "$@"
                     pass
 
     @contextlib.contextmanager
-    def daemon(self):
-        self.fixture.write_text("Row: 0 address=synthetic-sender, body=history, date=1, sub_id=1\n", encoding="utf-8")
+    def daemon(self, subscription_id=1, siminfo=None, initial_new_sms=True):
+        if siminfo is None:
+            siminfo = f"Row: 0 _id={subscription_id}, sim_id=0\n"
+        self.siminfo_fixture.write_text(siminfo, encoding="utf-8")
+        self.write_sms_records([(1, 1, subscription_id, "synthetic-sender", "history")])
         config = self.module / "core/config.conf"
         with config.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(f'''\nPUSH_CHANNEL="Bark"
@@ -287,9 +324,8 @@ ENABLE_OUTGOING_CALL="false"
 OS_TYPE="EMUI"
 INTERVAL=1
 ''')
-        env = dict(os.environ, PATH=f"{self.commands}:{os.environ['PATH']}",
-                   TMP_DIR=str(self.tmp), FIXTURE=str(self.fixture), POLLS=str(self.polls),
-                   CURL_HOME=str(self.module))
+        env = self.startup_env()
+        env.update(TMP_DIR=str(self.tmp), CURL_HOME=str(self.module))
         process = subprocess.Popen(["bash", str(self.module / "core/sms_daemon.sh")],
                                    env=env, start_new_session=True,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -297,9 +333,8 @@ INTERVAL=1
             wait_for(self.polls.exists)
             self.assertEqual(self.cursor(), "1")
             self.assertEqual(self.requests, [])
-            self.fixture.write_text(
-                f"Row: 0 address=synthetic-sender, body={BODY}, date=2, sub_id=1\n",
-                encoding="utf-8")
+            if initial_new_sms:
+                self.write_sms_records([(2, 2, subscription_id, "synthetic-sender", BODY)])
             yield
         finally:
             os.killpg(process.pid, signal.SIGTERM)
@@ -329,6 +364,94 @@ INTERVAL=1
             self.assertEqual(data["title"], "【短信】")
             self.assertIn(BODY, data["body"])
             self.assert_no_payload_files_or_sensitive_logs()
+
+    def test_verification_code_is_one_bark_notification_with_copy(self):
+        body = "您的验证码是 123456"
+        with self.daemon():
+            self.write_sms_records([(2, 2, 1, "service", body)])
+            wait_for(lambda: self.cursor() == "2")
+            time.sleep(0.1)
+            self.assertEqual(len(self.requests), 1)
+            data = json.loads(self.requests[0][2].decode("utf-8"))
+            self.assertEqual(data["copy"], "123456")
+            self.assertIn(body, data["body"])
+
+    def test_sim1_sms_is_complete_and_uses_the_mapped_subscription(self):
+        subscription_id = 42
+        sms_date = 1700000000123
+        address = "短信服务 Row: 2"
+        body = '验证码为 812345\nRow: 0, date=123, address=fake\r\t引号"反斜杠\\🙂'
+        siminfo = "Row: 0 _id=1, sim_id=1\nRow: 1 _id=42, sim_id=0\n"
+        with self.daemon(subscription_id=subscription_id, siminfo=siminfo):
+            self.write_sms_records([
+                (3, sms_date + 1, 1, "other-sender", "other subscription"),
+                (2, sms_date, subscription_id, address, body),
+                (1, 1, subscription_id, "synthetic-sender", "history"),
+            ])
+            wait_for(lambda: self.cursor() == str(sms_date))
+            wait_for(lambda: len(self.requests) == 1)
+            data = json.loads(self.requests[0][2].decode("utf-8"))
+            received_at = datetime.fromtimestamp(
+                sms_date / 1000, ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+            received_at += f".{sms_date % 1000:03d}"
+            self.assertEqual(data["title"], "【短信】 812345")
+            self.assertEqual(data["copy"], "812345")
+            self.assertIn(address, data["body"])
+            self.assertIn(received_at, data["body"])
+            self.assertIn(body, data["body"])
+            self.assertNotIn("other-sender", data["body"])
+            calls = self.content_calls.read_text(encoding="utf-8")
+            self.assertIn("content://telephony/siminfo", calls)
+            self.assertIn("--where sub_id=42", calls)
+
+    def test_missing_sim1_mapping_does_not_initialize_progress(self):
+        self.startup_config()
+        self.siminfo_fixture.write_text("Row: 0 _id=1, sim_id=1\n", encoding="utf-8")
+        self.write_sms_records([(2, 2, 1, "synthetic-sender", BODY)])
+        process = subprocess.Popen(["bash", str(self.module / "core/sms_daemon.sh")],
+                                   env=self.startup_env(), start_new_session=True,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            wait_for(lambda: "content://telephony/siminfo" in
+                     self.content_calls.read_text(encoding="utf-8"))
+            time.sleep(1.2)
+            cursor_file = self.tmp / "last_sms_date.txt"
+            self.assertFalse(cursor_file.exists())
+            self.assertEqual(self.requests, [])
+            self.assertNotIn("--projection date", self.content_calls.read_text(encoding="utf-8"))
+            cursor_file.write_text("1\n", encoding="utf-8")
+            time.sleep(1.2)
+            self.assertEqual(self.cursor(), "1")
+        finally:
+            os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=3)
+
+    def test_supported_code_patterns_have_fixed_priority_and_keep_unmatched_sms(self):
+        cases = [
+            ("验证码为 1234", "1234"),
+            ("Your code is 654321", "654321"),
+            ("验证码 12345678", "12345678"),
+            ("验证码 123", None),
+            ("验证码 123456789", None),
+            ("订单号 123456", None),
+            ("code 1111 验证码 2222", "1111"),
+        ]
+        with self.daemon(initial_new_sms=False):
+            for sms_date, (body, code) in enumerate(cases, start=3):
+                self.write_sms_records([
+                    (sms_date, sms_date, 1, "synthetic-sender", body),
+                    (1, 1, 1, "synthetic-sender", "history"),
+                ])
+                wait_for(lambda: self.cursor() == str(sms_date))
+                wait_for(lambda: len(self.requests) == sms_date - 2)
+                data = json.loads(self.requests[-1][2].decode("utf-8"))
+                if code is None:
+                    self.assertEqual(data["title"], "【短信】")
+                    self.assertNotIn("copy", data)
+                else:
+                    self.assertEqual(data["title"], f"【短信】 {code}")
+                    self.assertEqual(data["copy"], code)
+                self.assertIn(body, data["body"])
 
     def test_failure_response_does_not_advance_caller(self):
         cases = [

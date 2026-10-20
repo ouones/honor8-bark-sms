@@ -114,8 +114,8 @@ send_to_bark() {
 
     # NUL 分隔字段，内容只经过内存和管道，不放入命令参数或载荷文件。
     payload=$(
-        { printf '%s\000' "$BARK_DEVICE_KEY" "$1"; printf '%s' "$2"; } |
-            "$json" -Rsc 'split("\u0000") | {device_key: .[0], title: .[1], body: .[2]}' 2>/dev/null
+        { printf '%s\000' "$BARK_DEVICE_KEY" "$1" "$2"; printf '%s' "$3"; } |
+            "$json" -Rsc 'split("\u0000") | {device_key: .[0], title: .[1], body: .[2]} + (if .[3] == "" then {} else {copy: .[3]} end)' 2>/dev/null
     ) || { log_msg "ERROR" "Bark JSON 编码失败"; return 1; }
 
     # -q 禁用外部 curlrc，避免环境配置关闭证书验证或加入内部重试。
@@ -138,7 +138,7 @@ send_to_bark() {
 
 send_to_webhook() {
     if [ "${PUSH_CHANNEL:-DingTalk}" = "Bark" ]; then
-        send_to_bark "$1" "$2"
+        send_to_bark "$1" "$2" "$3"
         return $?
     fi
     # 强制在标题加入“通知”二字，突破钉钉拦截
@@ -182,14 +182,49 @@ init_timestamp() {
 
 # ================= 业务逻辑函数 =================
 
+get_sim1_sub_id() {
+    local raw_siminfo
+    raw_siminfo=$(content query --uri content://telephony/siminfo --projection _id:sim_id 2>/dev/null) || return 1
+    printf '%s\n' "$raw_siminfo" | awk -F '[, =]+' '
+    {
+        id = ""
+        slot = ""
+        for (i = 1; i < NF; i++) {
+            if ($i == "_id") id = $(i + 1)
+            if ($i == "sim_id") slot = $(i + 1)
+        }
+        if (slot == "0" && id ~ /^[0-9]+$/) {
+            count++
+            selected = id
+        }
+    }
+    END { if (count == 1) print selected }
+    '
+}
+
+hex_to_utf8() {
+    local hex="$1"
+    local byte
+    case "$hex" in *[!0-9A-Fa-f]*) return 1 ;; esac
+    [ $(( ${#hex} % 2 )) -eq 0 ] || return 1
+    while [ -n "$hex" ]; do
+        byte=${hex%"${hex#??}"}
+        hex=${hex#??}
+        printf '%b' "\\0$(printf '%03o' "$((0x$byte))")" || return 1
+    done
+}
+
 check_sms() {
+    local sim1_sub_id
+    sim1_sub_id=$(get_sim1_sub_id) || return 1
+    [ -n "$sim1_sub_id" ] || return 1
     local record_file="$TMP_DIR/last_sms_date.txt"
     local sms_uri="content://sms/inbox"
-    local where_cond=""
+    local where_cond="sub_id=$sim1_sub_id"
     
     if [ "$OS_TYPE" = "ColorOS" ]; then
         sms_uri="content://sms"
-        where_cond="type=1"
+        where_cond="type=1 AND sub_id=$sim1_sub_id"
     fi
 
     init_timestamp "$sms_uri" "$where_cond" "$record_file"
@@ -197,19 +232,21 @@ check_sms() {
     [ -z "$last_date" ] && last_date=0
     
     local raw_sms=""
-    if [ -n "$where_cond" ]; then
-        raw_sms=$(content query --uri "$sms_uri" --projection address:body:date:sub_id --where "$where_cond" --sort "date DESC" 2>/dev/null | head -n 1)
-    else
-        raw_sms=$(content query --uri "$sms_uri" --projection address:body:date:sub_id --sort "date DESC" 2>/dev/null | head -n 1)
-    fi
+    raw_sms=$(content query --uri "$sms_uri" --projection "date:sub_id:hex(address) AS address_hex:hex(body) AS body_hex" --where "$where_cond" --sort "date DESC" 2>/dev/null | head -n 1)
 
     if [ -n "$raw_sms" ]; then
-        local address=$(echo "$raw_sms" | sed 's/.*address=\(.*\), body=.*/\1/')
-        local body=$(echo "$raw_sms" | sed 's/.*body=\(.*\), date=.*/\1/')
-        local sms_date=$(echo "$raw_sms" | sed -n 's/.*date=\([^,]*\).*/\1/p' | tr -cd '0-9')
+        local address_hex=$(printf '%s\n' "$raw_sms" | sed -n 's/.*address_hex=\([[:xdigit:]]*\).*/\1/p')
+        local body_hex=$(printf '%s\n' "$raw_sms" | sed -n 's/.*body_hex=\([[:xdigit:]]*\).*/\1/p')
+        local address
+        address=$(hex_to_utf8 "$address_hex" && printf '.') || { log_msg "ERROR" "短信发件人解码失败"; return 1; }
+        address=${address%.}
+        local body
+        body=$(hex_to_utf8 "$body_hex" && printf '.') || { log_msg "ERROR" "短信正文解码失败"; return 1; }
+        body=${body%.}
+        local sms_date=$(printf '%s\n' "$raw_sms" | sed -n 's/.*date=\([0-9][0-9]*\).*/\1/p')
         local sub_id=$(echo "$raw_sms" | sed -n 's/.*sub_id=\([^,]*\).*/\1/p')
 
-        if [ -n "$sms_date" ] && [ "$sms_date" -gt "$last_date" ]; then
+        if [ "$sub_id" = "$sim1_sub_id" ] && [ -n "$sms_date" ] && [ "$sms_date" -gt "$last_date" ]; then
             local sim_tag="未知"
             [ "$sub_id" = "1" ] || [ "$sub_id" = "0" ] && sim_tag="卡1"
             [ "$sub_id" = "2" ] && sim_tag="卡2"
@@ -222,12 +259,25 @@ check_sms() {
             
             # 防贪婪精准提取补丁
             local safe_body=" $body"
-            local vcode=$(echo "$safe_body" | sed -n 's/.*[^0-9]\([0-9]\{4,8\}\)[^0-9]*验证码.*/\1/p')
-            [ -z "$vcode" ] && vcode=$(echo "$safe_body" | sed -n 's/.*验证码[^0-9]*\([0-9]\{4,8\}\).*/\1/p')
-            [ -z "$vcode" ] && vcode=$(echo "$safe_body" | sed -n 's/.*[Cc]ode[^0-9]*\([0-9]\{4,8\}\).*/\1/p')
+            local vcode=$(printf '%s\n' "$safe_body" | sed -n 's/.*[^0-9]\([0-9]\{4,8\}\)[^0-9]*验证码.*/\1/p')
+            [ -z "$vcode" ] && vcode=$(printf '%s\n' "$safe_body" | sed -n 's/.*验证码[^0-9]*\([0-9]\{4,8\}\)\([^0-9].*\)\{0,1\}$/\1/p')
+            [ -z "$vcode" ] && vcode=$(printf '%s\n' "$safe_body" | sed -n 's/.*[Cc]ode[^0-9]*\([0-9]\{4,8\}\)\([^0-9].*\)\{0,1\}$/\1/p')
 
-            local cb='```'
-            if [ -n "$vcode" ]; then
+            if [ "$PUSH_CHANNEL" = "Bark" ]; then
+                local received_at
+                received_at=$(date -d "@$((sms_date / 1000))" "+%Y-%m-%d %H:%M:%S") || return 1
+                received_at="${received_at}.$(printf '%03d' "$((sms_date % 1000))")"
+                local bark_title="$KEYWORD_SMS"
+                [ -n "$vcode" ] && bark_title="$KEYWORD_SMS $vcode"
+                local bark_body="发件人：$address
+接收时间：$received_at
+短信内容：
+$body"
+                if send_to_webhook "$bark_title" "$bark_body" "$vcode"; then
+                    echo "$sms_date" > "$record_file"
+                fi
+            elif [ -n "$vcode" ]; then
+                local cb='```'
                 local detail_msg="### 💬 ${KEYWORD_SMS} 详情\n\n---\n- **卡槽**: ${sim_tag}\n- **发件人**: ${address}\n- **内容**: ${body}"
                 send_to_webhook "${KEYWORD_SMS}" "$detail_msg"
                 
