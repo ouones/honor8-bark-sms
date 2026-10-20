@@ -29,7 +29,7 @@ esac
 for enabled in "$ENABLE_SMS" "$ENABLE_MISSED_CALL" "$ENABLE_INCOMING_CALL" "$ENABLE_OUTGOING_CALL"; do
     case "$enabled" in true|false) ;; *) startup_error "功能开关必须为 true 或 false" ;; esac
 done
-for tool in awk sed grep head tail tr date wc mv cat touch sleep flock content mkdir chmod rm; do
+for tool in awk sed grep head tail tr date wc mv cat touch sleep flock content timeout mkdir chmod rm; do
     command -v "$tool" >/dev/null 2>&1 || startup_error "缺少必需工具：$tool"
 done
 case "$PUSH_CHANNEL" in
@@ -63,7 +63,8 @@ esac
 # 锁文件保持原 inode，禁止删除；进程退出时由内核释放锁。
 umask 077
 exec 9>"$BASE_DIR/../sms_daemon.lock" || startup_error "无法打开启动锁"
-flock -n 9 || startup_error "守护进程已在运行"
+# 重复启动静默退出，避免服务入口反复追加诊断而绕过日志轮转。
+flock -n 9 || exit 1
 LOG_FILE="$TMP_DIR/sms_forward_run.log"
 SMS_STATE_DIR="$BASE_DIR/../state"
 SMS_CURSOR="$SMS_STATE_DIR/sms.cursor"
@@ -188,7 +189,8 @@ commit_sms_cursor() {
 
 query_sms_rows() {
     local raw
-    raw=$(content query --uri "$1" --projection "$2" --where "$3" --sort "$4" 2>&1) || {
+    # 每次 Provider 查询最多5秒；直接 KILL 避免卡住的进程忽略 TERM。
+    raw=$(timeout -s KILL 5 content query --uri "$1" --projection "$2" --where "$3" --sort "$4" 2>&1) || {
         log_msg "ERROR" "短信查询失败"
         return 1
     }
@@ -213,7 +215,7 @@ query_sms_rows() {
 
 get_sim1_sub_id() {
     local raw_siminfo
-    raw_siminfo=$(content query --uri content://telephony/siminfo --projection _id:sim_id 2>&1) || {
+    raw_siminfo=$(timeout -s KILL 5 content query --uri content://telephony/siminfo --projection _id:sim_id 2>&1) || {
         log_msg "ERROR" "SIM1 订阅查询失败"
         return 1
     }

@@ -120,7 +120,7 @@ if not found:
     print("No result found.")
 ''')
         self.write_command("sleep", '''#!/bin/sh
-printf 'poll\\n' >> "$POLLS"
+/usr/bin/python3 -c 'import time; print(time.monotonic(), "poll")' >> "$POLLS"
 exec /bin/sleep "$@"
 ''')
         self.write_sms_records([(1, 1, 1, "synthetic-sender", "history")])
@@ -206,7 +206,7 @@ exec /bin/sleep "$@"
             self.assertTrue(log.with_suffix(".log.bak").exists())
             second = subprocess.run(command, env=self.startup_env(), capture_output=True, timeout=2)
             self.assertNotEqual(second.returncode, 0)
-            self.assertIn("运行", second.stderr.decode("utf-8"))
+            self.assertEqual(second.stderr, b"")
             self.assertIsNone(first.poll())
         finally:
             os.killpg(first.pid, signal.SIGTERM)
@@ -220,6 +220,112 @@ exec /bin/sleep "$@"
         finally:
             os.killpg(restarted.pid, signal.SIGTERM)
             restarted.wait(timeout=3)
+
+    def test_idle_uses_default_wait_without_push_calls_or_log_writes(self):
+        self.startup_config('INTERVAL=5')
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            log = self.tmp / "sms_forward_run.log"
+            original_log = log.read_bytes()
+            wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= 3,
+                     timeout=13)
+            times = [float(line.split()[0])
+                     for line in self.polls.read_text(encoding="utf-8").splitlines()]
+            self.assertTrue(all(4.9 <= end - start < 7
+                                for start, end in zip(times, times[1:])), times)
+            calls = self.content_calls.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(calls), 6)
+            sms_calls = [line for line in calls if "content://sms/inbox" in line]
+            self.assertEqual(len(sms_calls), 3)
+            self.assertIn("date DESC, _id DESC LIMIT 1", sms_calls[0])
+            for line in sms_calls[1:]:
+                self.assertIn("sub_id=1 AND (date>1 OR (date=1 AND _id>1))", line)
+                self.assertIn("date ASC, _id ASC LIMIT 50", line)
+            self.assertNotIn("call_log", "\n".join(calls))
+            self.assertEqual(self.requests, [])
+            self.assertEqual(log.read_bytes(), original_log)
+            self.assert_no_payload_files_or_sensitive_logs()
+
+    def test_persistent_provider_errors_wait_and_rotate_only_one_backup(self):
+        self.startup_config('MAX_LOG_SIZE_KB=1')
+        self.write_command("content", '''#!/bin/sh
+printf '%s\\n' 'synthetic-device-key 验证码 123456 synthetic-sender' >&2
+exit 1
+''')
+        log = self.tmp / "sms_forward_run.log"
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            for count in range(2, 5):
+                log.write_text("x" * 1000 + "\n", encoding="utf-8")
+                wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= count)
+                self.assertLess(log.stat().st_size, 1024)
+                self.assertLess(log.with_suffix(".log.bak").stat().st_size, 1200)
+            times = [float(line.split()[0])
+                     for line in self.polls.read_text(encoding="utf-8").splitlines()]
+            self.assertTrue(all(0.9 <= end - start < 3
+                                for start, end in zip(times, times[1:])))
+            self.assertFalse(self.cursor_file.exists())
+            self.assertEqual(self.requests, [])
+            self.assertEqual({path.name for path in self.tmp.iterdir()},
+                             {"sms_forward_run.log", "sms_forward_run.log.bak"})
+            for path in self.tmp.iterdir():
+                text = path.read_text(encoding="utf-8")
+                for secret in (KEY, "123456", "synthetic-sender"):
+                    self.assertNotIn(secret, text)
+
+    def test_persistent_send_failures_wait_without_advancing_progress(self):
+        self.startup_config()
+        self.reply = (503, b'{"code":200}')
+        with self.running_daemon():
+            wait_for(self.polls.exists)
+            self.write_sms_records([(2, 100, 1, "synthetic-sender", BODY)])
+            wait_for(lambda: len(self.requests) >= 3)
+            self.assertEqual(len(self.requests), 3)
+            self.assertTrue(all(0.9 <= end - start < 3 for start, end in
+                                zip(self.request_times, self.request_times[1:])))
+            self.assertEqual(self.cursor(), "1 1")
+            self.assertNotIn("call_log", self.content_calls.read_text(encoding="utf-8"))
+            self.assert_no_payload_files_or_sensitive_logs()
+
+    def test_provider_hangs_are_killed_after_five_seconds_then_wait(self):
+        provider = (self.commands / "content").read_text(encoding="utf-8")
+        self.write_command("content-real", provider)
+        self.startup_config()
+        for phase in ("siminfo", "boundary", "incremental"):
+            with self.subTest(phase=phase):
+                self.polls.unlink(missing_ok=True)
+                self.cursor_file.unlink(missing_ok=True)
+                if phase == "incremental":
+                    self.cursor_file.write_text("1 1\n", encoding="utf-8")
+                attempts = self.module / "query-attempts"
+                attempts.write_text("", encoding="utf-8")
+                self.write_command("content", f'''#!/bin/sh
+case "$*" in
+    *siminfo*) [ '{phase}' = siminfo ] || exec "${{0%/*}}/content-real" "$@" ;;
+    *) [ '{phase}' != siminfo ] || exec "${{0%/*}}/content-real" "$@" ;;
+esac
+/usr/bin/python3 -c 'import time; print(time.monotonic())' >> "${{0%/*}}/../query-attempts"
+# Ignore TERM to prove the deadline cannot be bypassed by a stuck query.
+trap '' TERM
+exec /bin/sleep 30
+''')
+                with self.running_daemon():
+                    wait_for(lambda: attempts.read_text(encoding="utf-8").count("\n") >= 1)
+                    started = float(attempts.read_text(encoding="utf-8").splitlines()[0])
+                    wait_for(lambda: self.polls.exists() and
+                             self.polls.read_text(encoding="utf-8").count("poll") >= 1)
+                    finished = float(self.polls.read_text(encoding="utf-8").split()[0])
+                    self.assertGreaterEqual(finished - started, 4.8)
+                    self.assertLess(finished - started, 7)
+                    wait_for(lambda: attempts.read_text(encoding="utf-8").count("\n") >= 2)
+                    times = [float(line) for line in attempts.read_text(encoding="utf-8").splitlines()]
+                    self.assertGreaterEqual(times[1] - finished, 0.9)
+                    wait_for(lambda: self.polls.read_text(encoding="utf-8").count("poll") >= 2)
+                    if phase == "incremental":
+                        self.assertEqual(self.cursor(), "1 1")
+                    else:
+                        self.assertFalse(self.cursor_file.exists())
+                    self.assertEqual(self.requests, [])
 
     def test_bark_install_preserves_honor8_settings_without_keys(self):
         self.startup_config('BARK_API_URL="https://example.invalid/push"')
@@ -291,11 +397,11 @@ exec /usr/bin/busybox "$@"
         script.write_text((ROOT / "service.sh").read_text(encoding="utf-8").replace(
             "/data/adb/magisk/busybox", str(self.commands / "magisk-busybox")), encoding="utf-8")
         self.write_command("getprop", '#!/bin/sh\nprintf "1\\n"\n')
-        self.write_command("sleep", '#!/bin/sh\nexit 0\n')
+        self.write_command("sleep", '#!/bin/sh\n[ "$1" = 10 ] && exit 0\nexec /bin/sleep "$@"\n')
         (self.tmp / "sms_forward_run.log").write_text("x" * 1100, encoding="utf-8")
         groups = []
         try:
-            for _ in range(2):
+            for _ in range(30):
                 process = subprocess.Popen(["bash", str(script)], env=self.startup_env(),
                                            start_new_session=True, stdout=subprocess.DEVNULL,
                                            stderr=subprocess.DEVNULL)
@@ -304,6 +410,7 @@ exec /usr/bin/busybox "$@"
                 wait_for(self.cursor_file.exists)
             self.assertEqual(self.cursor(), "1 1")
             self.assertTrue((self.tmp / "sms_forward_run.log.bak").exists())
+            self.assertLess((self.tmp / "sms_forward_run.log").stat().st_size, 1024)
             self.write_sms_records([(2, 2, 1, "synthetic", BODY)])
             wait_for(lambda: self.cursor() == "2 2")
             time.sleep(1.2)
@@ -327,6 +434,11 @@ exec /usr/bin/busybox "$@"
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=3)
+            # A deliberately stuck external query may ignore TERM after its parent exits.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def test_initial_boundary_skips_history_and_ignores_legacy_state(self):
         self.startup_config()
