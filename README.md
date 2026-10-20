@@ -4,7 +4,7 @@ V2.3 荣耀8 Bark 迭代，基于原作者「双曲线与圆」的 V2.2 模块�
 
 正常联网时秒级转发，支持验证码复制、断网恢复补发和重启接续。
 
-本次支持范围为荣耀8 FRD-AL00、Android 8 / EMUI 8、Magisk 25.2，目标接收端为 iPhone 15 Pro 上的 Bark。旧钉钉及通话相关代码保留，其他机型、系统和 Root 管理器不在本次兼容保证范围。秒级转发依据本机正常联网时的用户观察，默认仍为5秒轮询。完整实测状态见 [T07 验收记录](docs/t07-verification.md)。
+本次支持范围为荣耀8 FRD-AL00、Android 8 / EMUI 8、Magisk 25.2，目标接收端为 iPhone 15 Pro 上的 Bark。旧钉钉及通话相关代码保留，其他机型、系统和 Root 管理器不在本次兼容保证范围。秒级转发依据本机正常联网时的用户观察，默认仍为5秒轮询。
 
 ## 行为与限制
 
@@ -55,4 +55,4 @@ tail -n 30 /data/local/tmp/sms_forward_run.log
 python3 -m unittest discover -s tests -v
 ```
 
-测试通过真实脚本进程、合成 Provider 输出和本机 HTTP 服务验证，不使用真实 key，也不向系统短信库写入伪造记录。依赖来源、散列和许可见 [bin/README.md](bin/README.md)，历史阶段证据见 [T01](docs/t01-verification.md)、[T02](docs/t02-verification.md) 和 [T06](docs/t06-verification.md)。
+测试通过真实脚本进程、合成 Provider 输出和本机 HTTP 服务验证，不使用真实 key，也不向系统短信库写入伪造记录。依赖来源、散列和许可见 [bin/README.md](bin/README.md)。
